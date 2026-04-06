@@ -945,39 +945,20 @@ def generate_iif(gl: pd.DataFrame, period=None) -> str:
 
 
 # ─────────────────────────────────────────────────────────────
-# 5 · WORD DOCUMENT EXPORT ENGINE (docx-js via Node.js)
+# 5 · WORD DOCUMENT EXPORT ENGINE (python-docx)
 # ─────────────────────────────────────────────────────────────
 
-def _get_node_path() -> str:
-    """Get the NODE_PATH for docx module resolution."""
-    # Try global npm root first
-    result = subprocess.run(["npm", "root", "-g"], capture_output=True, text=True)
-    global_root = result.stdout.strip()
-    if os.path.isdir(os.path.join(global_root, "docx")):
-        return global_root
-    # Try user-local prefix
-    home = os.path.expanduser("~")
-    for prefix in [os.path.join(home, ".npm-global"), "/sessions/wonderful-clever-cerf/.npm-global"]:
-        candidate = os.path.join(prefix, "lib", "node_modules")
-        if os.path.isdir(os.path.join(candidate, "docx")):
-            return candidate
-    return global_root
-
-
-def _ensure_docx_js():
-    """Install docx npm package if not present."""
-    node_path = _get_node_path()
-    if os.path.isdir(os.path.join(node_path, "docx")):
-        return
-    # Install to a known prefix
-    prefix = os.path.expanduser("~/.npm-global")
-    subprocess.run(["npm", "install", "-g", "docx", "--prefix", prefix],
-                   capture_output=True, text=True, check=True)
+from docx import Document as DocxDocument
+from docx.shared import Inches, Pt, Cm, RGBColor, Emu
+from docx.enum.text import WD_ALIGN_PARAGRAPH
+from docx.enum.table import WD_TABLE_ALIGNMENT
+from docx.oxml.ns import qn, nsdecls
+from docx.oxml import parse_xml
 
 
 def generate_docx_report(report_data: dict, output_path: str):
     """
-    Generate an Apple-branded Word document from report data using docx-js.
+    Generate an Apple-branded Word document from report data using python-docx.
     report_data keys:
       - title: str
       - subtitle: str
@@ -985,198 +966,161 @@ def generate_docx_report(report_data: dict, output_path: str):
       - sections: list of {heading, paragraphs: list[str], table: {headers, rows}}
       - checks: list of {check, status, detail}  (for preflight)
     """
-    _ensure_docx_js()
+    doc = DocxDocument()
 
-    # Escape for JS string embedding
-    def js_str(s):
-        return json.dumps(str(s) if s else "")
+    # ── Page setup ──
+    section = doc.sections[0]
+    section.page_width = Inches(8.5)
+    section.page_height = Inches(11)
+    section.top_margin = Inches(1)
+    section.bottom_margin = Inches(1)
+    section.left_margin = Inches(1)
+    section.right_margin = Inches(1)
 
-    sections_js = []
-    for sec in report_data.get("sections", []):
-        heading = js_str(sec.get("heading", ""))
-        # Paragraphs
-        para_js = []
-        for p in sec.get("paragraphs", []):
-            para_js.append(f'    new Paragraph({{ children: [new TextRun({{ text: {js_str(p)}, size: 21, font: "Helvetica" }})], spacing: {{ after: 120 }} }})')
+    # ── Default font ──
+    style = doc.styles["Normal"]
+    style.font.name = "Helvetica"
+    style.font.size = Pt(11)
+    style.font.color.rgb = RGBColor(0x1D, 0x1D, 0x1F)
+
+    # ── Header ──
+    header = section.header
+    header.is_linked_to_previous = False
+    hp = header.paragraphs[0] if header.paragraphs else header.add_paragraph()
+    hp.clear()
+    run1 = hp.add_run("Organization")
+    run1.bold = True
+    run1.font.size = Pt(8)
+    run1.font.color.rgb = RGBColor(0x8E, 0x8E, 0x93)
+    run2 = hp.add_run("  |  Month-End Close Agent")
+    run2.font.size = Pt(8)
+    run2.font.color.rgb = RGBColor(0x8E, 0x8E, 0x93)
+
+    # ── Footer ──
+    footer = section.footer
+    footer.is_linked_to_previous = False
+    fp = footer.paragraphs[0] if footer.paragraphs else footer.add_paragraph()
+    fp.clear()
+    fp.alignment = WD_ALIGN_PARAGRAPH.CENTER
+    fr = fp.add_run("Organization  |  Finance Department  |  Month-End Close Agent")
+    fr.font.size = Pt(7)
+    fr.font.color.rgb = RGBColor(0x8E, 0x8E, 0x93)
+
+    # ── Title block ──
+    doc.add_paragraph()  # spacer
+    title_p = doc.add_paragraph()
+    title_run = title_p.add_run(report_data.get("title", "Report"))
+    title_run.bold = True
+    title_run.font.size = Pt(24)
+    title_run.font.color.rgb = RGBColor(0x1D, 0x1D, 0x1F)
+
+    sub_p = doc.add_paragraph()
+    sub_run = sub_p.add_run(report_data.get("subtitle", ""))
+    sub_run.font.size = Pt(12)
+    sub_run.font.color.rgb = RGBColor(0x6E, 0x6E, 0x73)
+
+    date_str = report_data.get("date", datetime.date.today().strftime("%d %b %Y"))
+    date_p = doc.add_paragraph()
+    date_run = date_p.add_run(f"Generated: {date_str}")
+    date_run.font.size = Pt(10)
+    date_run.font.color.rgb = RGBColor(0x8E, 0x8E, 0x93)
+
+    # Blue divider after title
+    border_p = doc.add_paragraph()
+    pPr = border_p._p.get_or_add_pPr()
+    pBdr = parse_xml(f'<w:pBdr {nsdecls("w")}>'
+                     f'<w:bottom w:val="single" w:sz="12" w:space="4" w:color="0071E3"/>'
+                     f'</w:pBdr>')
+    pPr.append(pBdr)
+
+    doc.add_paragraph()  # spacer
+
+    # ── Sections ──
+    for sec_data in report_data.get("sections", []):
+        heading_text = sec_data.get("heading", "")
+        if heading_text:
+            h_p = doc.add_paragraph()
+            h_run = h_p.add_run(heading_text)
+            h_run.bold = True
+            h_run.font.size = Pt(14)
+            h_run.font.color.rgb = RGBColor(0x00, 0x71, 0xE3)
+            # Blue underline on heading
+            hPr = h_p._p.get_or_add_pPr()
+            hBdr = parse_xml(f'<w:pBdr {nsdecls("w")}>'
+                             f'<w:bottom w:val="single" w:sz="8" w:space="4" w:color="0071E3"/>'
+                             f'</w:pBdr>')
+            hPr.append(hBdr)
+
+        for para_text in sec_data.get("paragraphs", []):
+            p = doc.add_paragraph()
+            r = p.add_run(str(para_text))
+            r.font.size = Pt(10.5)
 
         # Table
-        tbl_js = ""
-        table = sec.get("table")
-        if table and table.get("headers") and table.get("rows"):
-            headers = table["headers"]
-            rows = table["rows"]
+        table_data = sec_data.get("table")
+        if table_data and table_data.get("headers") and table_data.get("rows"):
+            headers = table_data["headers"]
+            rows = table_data["rows"]
             n_cols = len(headers)
-            col_width = max(1, 9360 // n_cols)
-            col_widths_arr = [col_width] * n_cols
-            # Adjust last column to absorb rounding
-            col_widths_arr[-1] = 9360 - col_width * (n_cols - 1)
+            tbl = doc.add_table(rows=1 + len(rows), cols=n_cols)
+            tbl.alignment = WD_TABLE_ALIGNMENT.CENTER
+            tbl.autofit = True
 
-            header_cells = []
+            # Style header row
             for i, h in enumerate(headers):
-                header_cells.append(f"""
-                    new TableCell({{
-                        borders: tableBorders,
-                        width: {{ size: {col_widths_arr[i]}, type: WidthType.DXA }},
-                        shading: {{ fill: "0071E3", type: ShadingType.CLEAR }},
-                        margins: {{ top: 60, bottom: 60, left: 80, right: 80 }},
-                        children: [new Paragraph({{ children: [new TextRun({{ text: {js_str(h)}, bold: true, size: 18, font: "Helvetica", color: "FFFFFF" }})] }})]
-                    }})""")
+                cell = tbl.rows[0].cells[i]
+                cell.text = ""
+                p = cell.paragraphs[0]
+                r = p.add_run(str(h))
+                r.bold = True
+                r.font.size = Pt(9)
+                r.font.color.rgb = RGBColor(0xFF, 0xFF, 0xFF)
+                # Blue background
+                shading = parse_xml(f'<w:shd {nsdecls("w")} w:fill="0071E3" w:val="clear"/>')
+                cell._tc.get_or_add_tcPr().append(shading)
 
-            data_rows_js = []
-            for row in rows:
-                cells = []
-                for i, cell_val in enumerate(row):
-                    fill = "F5F5F7" if len(data_rows_js) % 2 == 0 else "FFFFFF"
-                    cells.append(f"""
-                        new TableCell({{
-                            borders: tableBorders,
-                            width: {{ size: {col_widths_arr[min(i, n_cols-1)]}, type: WidthType.DXA }},
-                            shading: {{ fill: "{fill}", type: ShadingType.CLEAR }},
-                            margins: {{ top: 40, bottom: 40, left: 80, right: 80 }},
-                            children: [new Paragraph({{ children: [new TextRun({{ text: {js_str(cell_val)}, size: 18, font: "Helvetica" }})] }})]
-                        }})""")
-                data_rows_js.append(f"    new TableRow({{ children: [{','.join(cells)}] }})")
+            # Data rows with alternating shading
+            for ri, row in enumerate(rows):
+                fill = "F5F5F7" if ri % 2 == 0 else "FFFFFF"
+                for ci, cell_val in enumerate(row):
+                    if ci >= n_cols:
+                        break
+                    cell = tbl.rows[ri + 1].cells[ci]
+                    cell.text = ""
+                    p = cell.paragraphs[0]
+                    r = p.add_run(str(cell_val) if cell_val is not None else "")
+                    r.font.size = Pt(9)
+                    shading = parse_xml(f'<w:shd {nsdecls("w")} w:fill="{fill}" w:val="clear"/>')
+                    cell._tc.get_or_add_tcPr().append(shading)
 
-            tbl_js = f"""
-    new Table({{
-        width: {{ size: 9360, type: WidthType.DXA }},
-        columnWidths: [{','.join(str(w) for w in col_widths_arr)}],
-        rows: [
-            new TableRow({{ children: [{','.join(header_cells)}] }}),
-            {','.join(data_rows_js)}
-        ]
-    }})"""
+            # Light gray borders on all cells
+            for row_obj in tbl.rows:
+                for cell in row_obj.cells:
+                    tcPr = cell._tc.get_or_add_tcPr()
+                    borders = parse_xml(
+                        f'<w:tcBorders {nsdecls("w")}>'
+                        f'<w:top w:val="single" w:sz="2" w:space="0" w:color="D2D2D7"/>'
+                        f'<w:bottom w:val="single" w:sz="2" w:space="0" w:color="D2D2D7"/>'
+                        f'<w:left w:val="single" w:sz="2" w:space="0" w:color="D2D2D7"/>'
+                        f'<w:right w:val="single" w:sz="2" w:space="0" w:color="D2D2D7"/>'
+                        f'</w:tcBorders>'
+                    )
+                    tcPr.append(borders)
 
-        # Build section children
-        children_parts = [
-            f'    new Paragraph({{ heading: HeadingLevel.HEADING_2, children: [new TextRun({{ text: {heading}, font: "Helvetica" }})] }})'
-        ]
-        children_parts.extend(para_js)
-        if tbl_js:
-            children_parts.append(tbl_js)
+            doc.add_paragraph()  # spacer after table
 
-        sections_js.append(",\n".join(children_parts))
-
-    all_children = ",\n    new Paragraph({ children: [] }),\n".join(sections_js)
-
-    # Checks section (for preflight report)
-    checks_js = ""
+    # ── Checks section (for preflight report) ──
     checks = report_data.get("checks", [])
     if checks:
-        check_paras = []
+        doc.add_paragraph()
         for ck in checks:
             icon = "\u2705" if ck["status"] == "PASS" else ("\u274C" if ck["status"] == "FAIL" else "\u26A0\uFE0F")
-            ck_text = icon + " " + ck["check"] + " — " + ck["detail"]
-            check_paras.append(
-                f'    new Paragraph({{ children: [new TextRun({{ text: {js_str(ck_text)}, size: 20, font: "Helvetica" }})], spacing: {{ after: 80 }} }})'
-            )
-        checks_js = ",\n".join(check_paras)
-        if all_children:
-            all_children += ",\n    new Paragraph({ children: [] }),\n" + checks_js
-        else:
-            all_children = checks_js
+            ck_text = f'{icon} {ck["check"]} \u2014 {ck["detail"]}'
+            p = doc.add_paragraph()
+            r = p.add_run(ck_text)
+            r.font.size = Pt(10)
 
-    js_code = f"""
-const fs = require("fs");
-const {{ Document, Packer, Paragraph, TextRun, Table, TableRow, TableCell,
-         Header, Footer, AlignmentType, HeadingLevel, BorderStyle, WidthType,
-         ShadingType, PageNumber, PageBreak, LevelFormat }} = require("docx");
-
-const tableBorders = {{
-    top: {{ style: BorderStyle.SINGLE, size: 1, color: "D2D2D7" }},
-    bottom: {{ style: BorderStyle.SINGLE, size: 1, color: "D2D2D7" }},
-    left: {{ style: BorderStyle.SINGLE, size: 1, color: "D2D2D7" }},
-    right: {{ style: BorderStyle.SINGLE, size: 1, color: "D2D2D7" }},
-}};
-
-const doc = new Document({{
-    styles: {{
-        default: {{ document: {{ run: {{ font: "Helvetica", size: 22 }} }} }},
-        paragraphStyles: [
-            {{ id: "Heading1", name: "Heading 1", basedOn: "Normal", next: "Normal", quickFormat: true,
-               run: {{ size: 36, bold: true, font: "Helvetica", color: "1D1D1F" }},
-               paragraph: {{ spacing: {{ before: 240, after: 120 }}, outlineLevel: 0 }} }},
-            {{ id: "Heading2", name: "Heading 2", basedOn: "Normal", next: "Normal", quickFormat: true,
-               run: {{ size: 28, bold: true, font: "Helvetica", color: "0071E3" }},
-               paragraph: {{ spacing: {{ before: 200, after: 100 }}, outlineLevel: 1,
-                   border: {{ bottom: {{ style: BorderStyle.SINGLE, size: 4, color: "0071E3", space: 4 }} }}
-               }} }},
-        ]
-    }},
-    sections: [{{
-        properties: {{
-            page: {{
-                size: {{ width: 12240, height: 15840 }},
-                margin: {{ top: 1440, right: 1440, bottom: 1440, left: 1440 }}
-            }}
-        }},
-        headers: {{
-            default: new Header({{
-                children: [new Paragraph({{
-                    children: [
-                        new TextRun({{ text: "Organization", bold: true, size: 16, font: "Helvetica", color: "8E8E93" }}),
-                        new TextRun({{ text: "  |  Month-End Close Agent", size: 16, font: "Helvetica", color: "8E8E93" }}),
-                    ],
-                    border: {{ bottom: {{ style: BorderStyle.SINGLE, size: 2, color: "D2D2D7", space: 4 }} }}
-                }})]
-            }})
-        }},
-        footers: {{
-            default: new Footer({{
-                children: [new Paragraph({{
-                    alignment: AlignmentType.CENTER,
-                    children: [
-                        new TextRun({{ text: "Organization  |  Finance Department  |  ", size: 14, font: "Helvetica", color: "8E8E93" }}),
-                        new TextRun({{ text: "Page ", size: 14, font: "Helvetica", color: "8E8E93" }}),
-                        new TextRun({{ children: [PageNumber.CURRENT], size: 14, font: "Helvetica", color: "8E8E93" }}),
-                    ],
-                    border: {{ top: {{ style: BorderStyle.SINGLE, size: 2, color: "D2D2D7", space: 4 }} }}
-                }})]
-            }})
-        }},
-        children: [
-            // Title block
-            new Paragraph({{ children: [] }}),
-            new Paragraph({{
-                children: [new TextRun({{ text: {js_str(report_data.get("title", "Report"))}, bold: true, size: 48, font: "Helvetica", color: "1D1D1F" }})],
-                spacing: {{ after: 60 }}
-            }}),
-            new Paragraph({{
-                children: [new TextRun({{ text: {js_str(report_data.get("subtitle", ""))}, size: 24, font: "Helvetica", color: "6E6E73" }})],
-                spacing: {{ after: 40 }}
-            }}),
-            new Paragraph({{
-                children: [new TextRun({{ text: {js_str(f"Generated: {report_data.get('date', datetime.date.today().strftime('%d %b %Y'))}")}, size: 20, font: "Helvetica", color: "8E8E93" }})],
-                spacing: {{ after: 200 }},
-                border: {{ bottom: {{ style: BorderStyle.SINGLE, size: 6, color: "0071E3", space: 8 }} }}
-            }}),
-            new Paragraph({{ children: [] }}),
-            {all_children}
-        ]
-    }}]
-}});
-
-Packer.toBuffer(doc).then(buffer => {{
-    fs.writeFileSync({js_str(output_path)}, buffer);
-}});
-"""
-
-    # Write and execute
-    with tempfile.NamedTemporaryFile(mode="w", suffix=".js", delete=False) as f:
-        f.write(js_code)
-        js_path = f.name
-
-    try:
-        node_path = _get_node_path()
-        result = subprocess.run(
-            ["node", js_path],
-            capture_output=True, text=True, timeout=30,
-            env={**os.environ, "NODE_PATH": node_path}
-        )
-        if result.returncode != 0:
-            raise RuntimeError(f"docx generation failed: {result.stderr}")
-    finally:
-        os.unlink(js_path)
+    doc.save(output_path)
 
 
 def build_flux_docx_data(gl: pd.DataFrame) -> dict:
