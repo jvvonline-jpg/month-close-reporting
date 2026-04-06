@@ -1,5 +1,7 @@
 # Month-End Close Agent
 
+**Finance Department**
+
 An intelligent Streamlit application for automated month-end close diagnostics. Processes QuickBooks GL exports and generates six advanced analytical reports with Apple-branded Word document output.
 
 ## Repository Structure
@@ -65,5 +67,5 @@ streamlit run app.py
 
 ## Export Formats
 
-- **Word Documents (.docx)**: Apple-branded reports with Cornerstones headers/footers
+- **Word Documents (.docx)**: Branded reports with organization headers/footers
 - **IIF File**: Tab-delimited QuickBooks import file with TRNS/SPL/ENDTRNS structure

@@ -1,7 +1,7 @@
 """
 Month-End Close Agent — Streamlit Application
-Cornerstones, Inc. | Finance Department
-Apple-branded diagnostic reporting for QuickBooks month-end close.
+Finance Department
+Diagnostic reporting for QuickBooks month-end close.
 
 Reports:
   1. Flux (Variance) Narrative
@@ -47,7 +47,7 @@ APPLE = {
 }
 
 st.set_page_config(
-    page_title="Month-End Close Agent · Cornerstones",
+    page_title="Month-End Close Agent · Month-End Close",
     page_icon="🏢",
     layout="wide",
     initial_sidebar_state="expanded",
@@ -183,9 +183,18 @@ def fmt_currency(v):
 
 @st.cache_data
 def parse_gl(file) -> pd.DataFrame:
-    """Parse a General Ledger from CSV or QuickBooks Excel export."""
+    """Parse a General Ledger from CSV or QuickBooks Excel export.
+
+    Sniffs the actual file content to detect Excel binaries even when
+    the extension is .csv (common with QuickBooks exports).
+    """
+    # Read first 4 bytes to detect file type
+    header = file.read(4)
+    file.seek(0)
+    is_excel = header[:2] == b"PK" or header[:8] == b"\xd0\xcf\x11\xe0"
+
     name = file.name.lower()
-    if name.endswith((".xlsx", ".xls")):
+    if is_excel or name.endswith((".xlsx", ".xls")):
         return _parse_gl_excel(file)
     else:
         return _parse_gl_csv(file)
@@ -193,7 +202,17 @@ def parse_gl(file) -> pd.DataFrame:
 
 def _parse_gl_csv(file) -> pd.DataFrame:
     """Handles standard CSV GL exports with named columns."""
-    df = pd.read_csv(file)
+    # Try multiple encodings for robustness
+    for encoding in ["utf-8", "latin-1", "cp1252"]:
+        try:
+            file.seek(0)
+            df = pd.read_csv(file, encoding=encoding)
+            break
+        except (UnicodeDecodeError, pd.errors.ParserError):
+            continue
+    else:
+        file.seek(0)
+        df = pd.read_csv(file, encoding="latin-1", on_bad_lines="skip")
     df.columns = [c.strip() for c in df.columns]
     col_map = {}
     for c in df.columns:
@@ -1093,7 +1112,7 @@ const doc = new Document({{
             default: new Header({{
                 children: [new Paragraph({{
                     children: [
-                        new TextRun({{ text: "Cornerstones, Inc.", bold: true, size: 16, font: "Helvetica", color: "8E8E93" }}),
+                        new TextRun({{ text: "Organization", bold: true, size: 16, font: "Helvetica", color: "8E8E93" }}),
                         new TextRun({{ text: "  |  Month-End Close Agent", size: 16, font: "Helvetica", color: "8E8E93" }}),
                     ],
                     border: {{ bottom: {{ style: BorderStyle.SINGLE, size: 2, color: "D2D2D7", space: 4 }} }}
@@ -1105,7 +1124,7 @@ const doc = new Document({{
                 children: [new Paragraph({{
                     alignment: AlignmentType.CENTER,
                     children: [
-                        new TextRun({{ text: "Cornerstones, Inc.  |  Finance Department  |  ", size: 14, font: "Helvetica", color: "8E8E93" }}),
+                        new TextRun({{ text: "Organization  |  Finance Department  |  ", size: 14, font: "Helvetica", color: "8E8E93" }}),
                         new TextRun({{ text: "Page ", size: 14, font: "Helvetica", color: "8E8E93" }}),
                         new TextRun({{ children: [PageNumber.CURRENT], size: 14, font: "Helvetica", color: "8E8E93" }}),
                     ],
@@ -1207,7 +1226,7 @@ def build_flux_docx_data(gl: pd.DataFrame) -> dict:
 
     return {
         "title": "Flux (Variance) Narrative Report",
-        "subtitle": f"Cornerstones, Inc.  |  {prev} vs {curr}",
+        "subtitle": f"Organization  |  {prev} vs {curr}",
         "date": datetime.date.today().strftime("%d %b %Y"),
         "sections": [
             {"heading": "Variance Narrative", "paragraphs": narratives},
@@ -1258,7 +1277,7 @@ def build_vendor_gap_docx_data(gl: pd.DataFrame) -> dict:
 
     return {
         "title": "Recurring Vendor Gap Analysis",
-        "subtitle": "Cornerstones, Inc.  |  Missing Bill Report",
+        "subtitle": "Organization  |  Missing Bill Report",
         "date": datetime.date.today().strftime("%d %b %Y"),
         "sections": [
             {"heading": "Summary",
@@ -1309,7 +1328,7 @@ def build_suspense_docx_data(gl: pd.DataFrame, coa: dict | None) -> dict:
 
     return {
         "title": "Suspense & Misc Resolution Worksheet",
-        "subtitle": "Cornerstones, Inc.  |  Reclassification Recommendations",
+        "subtitle": "Organization  |  Reclassification Recommendations",
         "date": datetime.date.today().strftime("%d %b %Y"),
         "sections": [
             {"heading": "Summary",
@@ -1356,7 +1375,7 @@ def build_materiality_docx_data(gl: pd.DataFrame, threshold: float) -> dict:
 
     return {
         "title": "Materiality & Risk Threshold Report",
-        "subtitle": f"Cornerstones, Inc.  |  Threshold: ${threshold:,.0f}",
+        "subtitle": f"Organization  |  Threshold: ${threshold:,.0f}",
         "date": datetime.date.today().strftime("%d %b %Y"),
         "sections": [
             {"heading": "Summary",
@@ -1406,7 +1425,7 @@ def build_preflight_docx_data(gl: pd.DataFrame, coa: dict | None) -> dict:
 
     return {
         "title": "IIF Import Pre-Flight Validation",
-        "subtitle": "Cornerstones, Inc.  |  Technical Validation",
+        "subtitle": "Organization  |  Technical Validation",
         "date": datetime.date.today().strftime("%d %b %Y"),
         "sections": [
             {"heading": "Validation Results",
@@ -1446,7 +1465,7 @@ def export_all_reports_docx(gl, coa, threshold, pdf_texts):
 
     reports["06_Reconciliation_Summary"] = {
         "title": "Multi-Source Reconciliation Summary",
-        "subtitle": "Cornerstones, Inc.  |  Three-Way Reconciliation",
+        "subtitle": "Organization  |  Three-Way Reconciliation",
         "date": datetime.date.today().strftime("%d %b %Y"),
         "sections": [
             {"heading": "Overview",
@@ -1495,7 +1514,7 @@ def main():
     st.markdown("""
     <div class="apple-header">
         <h1>Month-End Close Agent</h1>
-        <p>Cornerstones, Inc. &nbsp;|&nbsp; Finance Department &nbsp;|&nbsp; Diagnostic Reporting Suite</p>
+        <p>Organization &nbsp;|&nbsp; Finance Department &nbsp;|&nbsp; Diagnostic Reporting Suite</p>
     </div>
     """, unsafe_allow_html=True)
 
@@ -1642,7 +1661,7 @@ def main():
     # Footer
     st.markdown(f"""
     <div class="apple-footer">
-        Cornerstones, Inc. &nbsp;|&nbsp; Finance Department &nbsp;|&nbsp; Month-End Close Agent
+        Organization &nbsp;|&nbsp; Finance Department &nbsp;|&nbsp; Month-End Close Agent
         &nbsp;|&nbsp; Generated {datetime.date.today().strftime('%d %b %Y')}
     </div>
     """, unsafe_allow_html=True)
