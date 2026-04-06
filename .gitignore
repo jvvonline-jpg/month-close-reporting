@@ -1,0 +1,16 @@
+# Data files — keep private
+*.csv
+*.xlsx
+*.xls
+*.IIF
+*.iif
+*.pdf
+
+# Environment
+__pycache__/
+*.pyc
+.env
+.streamlit/secrets.toml
+node_modules/
+*.tmp
+.DS_Store
