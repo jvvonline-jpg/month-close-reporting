@@ -259,11 +259,13 @@ def _parse_gl_excel(file) -> pd.DataFrame:
     if header_idx is None:
         header_idx = 0
 
-    header_row = raw.iloc[header_idx].astype(str).str.strip()
     col_indices = {}
     known_header_names = {"type", "date", "num", "name", "memo", "split", "debit", "credit", "balance"}
-    for idx, val in header_row.items():
-        vl = val.lower().strip()
+    for idx in range(raw.shape[1]):
+        val = raw.iloc[header_idx, idx]
+        if pd.isna(val):
+            continue
+        vl = str(val).lower().strip()
         if vl in known_header_names:
             col_indices[vl.capitalize()] = idx
 
