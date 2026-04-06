@@ -1,7 +1,5 @@
 # Month-End Close Agent
 
-**Cornerstones, Inc. | Finance Department**
-
 An intelligent Streamlit application for automated month-end close diagnostics. Processes QuickBooks GL exports and generates six advanced analytical reports with Apple-branded Word document output.
 
 ## Repository Structure
