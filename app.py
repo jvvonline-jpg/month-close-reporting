@@ -429,7 +429,7 @@ _MONTH_ABBREVS = {
 
 
 def _detect_month_from_header(header_str: str):
-    """Try to extract a (year, month) from a column header like 'Jul 2025', 'July 25', '2025-07', etc.
+    """Try to extract a (year, month) from a column header like 'Jul 26, 25', 'Jul 2025', '2025-07', etc.
 
     Returns (year, month) tuple or None.
     """
@@ -437,8 +437,21 @@ def _detect_month_from_header(header_str: str):
     if not s or s.lower() in ("nan", "none", "total", ""):
         return None
 
-    # Pattern: "Jul 2025", "July 2025", "Jul 25", "July '25"
-    m = re.match(r"(?i)([a-z]+)['\s\-,.]*(\d{2,4})", s)
+    # Pattern 1: "Jul 26, 25" or "Jul 26, 2025" (Mon DD, YY — QuickBooks format)
+    # Must check BEFORE the simpler pattern so the day isn't mistaken for the year
+    m = re.match(r"(?i)([a-z]+)\s+\d{1,2},?\s+(\d{2,4})", s)
+    if m:
+        mon_str = m.group(1).lower()
+        yr_str = m.group(2)
+        mon = _MONTH_ABBREVS.get(mon_str)
+        if mon:
+            yr = int(yr_str)
+            if yr < 100:
+                yr += 2000
+            return (yr, mon)
+
+    # Pattern 2: "Jul 2025", "July 2025", "Jul 25", "July '25" (no day number)
+    m = re.match(r"(?i)([a-z]+)['\s\-,.]+(\d{2,4})$", s)
     if m:
         mon_str = m.group(1).lower()
         yr_str = m.group(2)
@@ -465,7 +478,10 @@ def _detect_month_from_header(header_str: str):
 
 
 def parse_balance_report(file) -> pd.DataFrame | None:
-    """Parse a monthly balance report (BS or P&L) where accounts are rows and months are columns.
+    """Parse a QuickBooks monthly balance report (BS) where accounts are rows and months are columns.
+
+    Handles QuickBooks hierarchical indentation where accounts appear across columns 0-5,
+    and data columns are on even-numbered columns with blank spacer columns in between.
 
     Returns a DataFrame with columns: Account, and one column per detected month
     labeled as 'YYYY-MM' (e.g., '2025-07'), values are floats.
@@ -478,7 +494,11 @@ def parse_balance_report(file) -> pd.DataFrame | None:
 
         name = file.name.lower()
         if is_excel or name.endswith((".xlsx", ".xls")):
-            raw = pd.read_excel(file, header=None, engine="openpyxl")
+            # Use ExcelFile to pick "Sheet1" (skip "QuickBooks Desktop Export Tips")
+            xls = pd.ExcelFile(file, engine="openpyxl")
+            sheets = xls.sheet_names
+            target = "Sheet1" if "Sheet1" in sheets else sheets[-1]
+            raw = pd.read_excel(xls, sheet_name=target, header=None)
         else:
             file.seek(0)
             raw = pd.read_csv(file, header=None, encoding="latin-1")
@@ -507,25 +527,68 @@ def parse_balance_report(file) -> pd.DataFrame | None:
     if best_count < 1:
         return None
 
-    # Determine the account column (usually the first text column before the month columns)
-    first_month_col = min(best_map.keys())
-    acct_col = 0
-    for ci in range(first_month_col):
-        # Pick the column with the most non-empty string values
-        vals = raw.iloc[best_row + 1:, ci].dropna()
-        if len(vals) > 0:
-            acct_col = ci
-            break
+    # Deduplicate month columns — if multiple columns map to the same YYYY-MM
+    # (e.g., two April snapshots), keep only the LAST (rightmost / most recent) one.
+    deduped_map = {}
+    for ci in sorted(best_map.keys()):
+        label = best_map[ci]
+        deduped_map[label] = ci  # later column overwrites earlier
+    best_map = {ci: label for label, ci in deduped_map.items()}
 
-    # Build clean DataFrame
+    # Determine the account columns — QuickBooks uses columns 0..N-1 for
+    # hierarchically indented account names. first_data_col is the first
+    # month-data column; everything before that is potential account name columns.
+    first_data_col = min(best_map.keys())
+    acct_cols = list(range(first_data_col))  # e.g., [0, 1, 2, 3, 4, 5]
+    if not acct_cols:
+        acct_cols = [0]
+
+    # Patterns to skip — section headers and totals in QB hierarchy
+    _skip_re = re.compile(
+        r"(?i)^("
+        r"total\s|"
+        r"net\s|"
+        r"other\s*(total|net)|"
+        r"ASSETS$|"
+        r"LIABILITIES$|"
+        r"EQUITY$|"
+        r"LIABILITIES\s*&\s*EQUITY$|"
+        r"Current\s+Assets$|"
+        r"Fixed\s+Assets$|"
+        r"Other\s+Assets$|"
+        r"Current\s+Liabilities$|"
+        r"Long[\s\-]*Term\s+Liabilities$|"
+        r"Other\s+Liabilities$|"
+        r"Checking/Savings$|"
+        r"Accounts\s+Receivable$|"
+        r"Accounts\s+Payable$|"
+        r"Other\s+Current\s+Liabilities$|"
+        r"Other\s+Current\s+Assets$|"
+        r"Credit\s+Cards$|"
+        r"Ordinary\s+Income/Expense$|"
+        r"Income$|"
+        r"Cost\s+of\s+Goods\s+Sold$|"
+        r"Expense$|"
+        r"Other\s+Income/Expense$"
+        r")"
+    )
+
+    # Build clean DataFrame — scan all account columns to find deepest non-null name
     records = []
     for i in range(best_row + 1, len(raw)):
-        acct_val = raw.iloc[i, acct_col]
-        if pd.isna(acct_val) or str(acct_val).strip() == "":
+        # Find account name: use the deepest (rightmost) non-null column
+        acct_name = None
+        for ac in reversed(acct_cols):
+            val = raw.iloc[i, ac]
+            if pd.notna(val) and str(val).strip():
+                acct_name = str(val).strip()
+                break
+
+        if not acct_name:
             continue
-        acct_name = str(acct_val).strip()
-        # Skip total/header rows
-        if re.match(r"(?i)^(total|net\s|other\s*(total|net)|^$)", acct_name):
+
+        # Skip section headers and totals
+        if _skip_re.match(acct_name):
             continue
 
         row = {"Account": acct_name}
