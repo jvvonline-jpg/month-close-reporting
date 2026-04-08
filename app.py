@@ -416,6 +416,155 @@ def extract_pdf_text(file) -> str:
 
 
 # ─────────────────────────────────────────────────────────────
+# 2b · BALANCE REPORT PARSER (Monthly BS / P&L)
+# ─────────────────────────────────────────────────────────────
+
+_MONTH_ABBREVS = {
+    "jan": 1, "feb": 2, "mar": 3, "apr": 4, "may": 5, "jun": 6,
+    "jul": 7, "aug": 8, "sep": 9, "oct": 10, "nov": 11, "dec": 12,
+    "january": 1, "february": 2, "march": 3, "april": 4,
+    "june": 6, "july": 7, "august": 8, "september": 9,
+    "october": 10, "november": 11, "december": 12,
+}
+
+
+def _detect_month_from_header(header_str: str):
+    """Try to extract a (year, month) from a column header like 'Jul 2025', 'July 25', '2025-07', etc.
+
+    Returns (year, month) tuple or None.
+    """
+    s = str(header_str).strip()
+    if not s or s.lower() in ("nan", "none", "total", ""):
+        return None
+
+    # Pattern: "Jul 2025", "July 2025", "Jul 25", "July '25"
+    m = re.match(r"(?i)([a-z]+)['\s\-,.]*(\d{2,4})", s)
+    if m:
+        mon_str = m.group(1).lower()
+        yr_str = m.group(2)
+        mon = _MONTH_ABBREVS.get(mon_str)
+        if mon:
+            yr = int(yr_str)
+            if yr < 100:
+                yr += 2000
+            return (yr, mon)
+
+    # Pattern: "2025-07", "2025/07"
+    m = re.match(r"(\d{4})[\-/](\d{1,2})", s)
+    if m:
+        return (int(m.group(1)), int(m.group(2)))
+
+    # Pattern: "07/2025", "7/2025"
+    m = re.match(r"(\d{1,2})[\-/](\d{4})", s)
+    if m:
+        mon, yr = int(m.group(1)), int(m.group(2))
+        if 1 <= mon <= 12:
+            return (yr, mon)
+
+    return None
+
+
+def parse_balance_report(file) -> pd.DataFrame | None:
+    """Parse a monthly balance report (BS or P&L) where accounts are rows and months are columns.
+
+    Returns a DataFrame with columns: Account, and one column per detected month
+    labeled as 'YYYY-MM' (e.g., '2025-07'), values are floats.
+    Returns None if parsing fails.
+    """
+    try:
+        header = file.read(4)
+        file.seek(0)
+        is_excel = header[:2] == b"PK" or header[:4] == b"\xd0\xcf\x11\xe0"
+
+        name = file.name.lower()
+        if is_excel or name.endswith((".xlsx", ".xls")):
+            raw = pd.read_excel(file, header=None, engine="openpyxl")
+        else:
+            file.seek(0)
+            raw = pd.read_csv(file, header=None, encoding="latin-1")
+    except Exception:
+        return None
+
+    if raw.empty or raw.shape[1] < 2:
+        return None
+
+    # Detect the header row — the one with the most month-parseable columns
+    best_row = 0
+    best_count = 0
+    best_map = {}
+    for i in range(min(15, len(raw))):
+        month_map = {}
+        for ci in range(raw.shape[1]):
+            val = raw.iloc[i, ci]
+            parsed = _detect_month_from_header(val)
+            if parsed:
+                month_map[ci] = parsed
+        if len(month_map) > best_count:
+            best_count = len(month_map)
+            best_row = i
+            best_map = month_map
+
+    if best_count < 1:
+        return None
+
+    # Determine the account column (usually the first text column before the month columns)
+    first_month_col = min(best_map.keys())
+    acct_col = 0
+    for ci in range(first_month_col):
+        # Pick the column with the most non-empty string values
+        vals = raw.iloc[best_row + 1:, ci].dropna()
+        if len(vals) > 0:
+            acct_col = ci
+            break
+
+    # Build clean DataFrame
+    records = []
+    for i in range(best_row + 1, len(raw)):
+        acct_val = raw.iloc[i, acct_col]
+        if pd.isna(acct_val) or str(acct_val).strip() == "":
+            continue
+        acct_name = str(acct_val).strip()
+        # Skip total/header rows
+        if re.match(r"(?i)^(total|net\s|other\s*(total|net)|^$)", acct_name):
+            continue
+
+        row = {"Account": acct_name}
+        has_value = False
+        for ci, (yr, mon) in best_map.items():
+            cell = raw.iloc[i, ci]
+            # Parse numeric value, stripping $ , ( ) etc.
+            if pd.isna(cell):
+                num = 0.0
+            else:
+                cleaned = re.sub(r"[,$\s]", "", str(cell))
+                # Handle parenthetical negatives
+                neg = cleaned.startswith("(") and cleaned.endswith(")")
+                cleaned = cleaned.strip("()")
+                try:
+                    num = float(cleaned)
+                    if neg:
+                        num = -num
+                    has_value = True
+                except ValueError:
+                    num = 0.0
+            col_label = f"{yr}-{mon:02d}"
+            row[col_label] = num
+
+        if has_value:
+            records.append(row)
+
+    if not records:
+        return None
+
+    df = pd.DataFrame(records)
+    # Consolidate duplicate account names (sum them)
+    month_cols = [c for c in df.columns if c != "Account"]
+    if month_cols:
+        df = df.groupby("Account", as_index=False)[month_cols].sum()
+    return df
+
+
+# ─────────────────────────────────────────────────────────────
 # 3 · REPORT ENGINES
 # ─────────────────────────────────────────────────────────────
 
@@ -982,15 +1131,73 @@ def _get_preceding_months(closing_month: int, start_month: int) -> list[int]:
     return months
 
 
-def _build_closing_variance_table(gl: pd.DataFrame, account_type: str,
+def _build_balance_variance_table(balance_df: pd.DataFrame,
                                    closing_month: int, start_month: int,
                                    top_n: int = 20):
-    """Build variance analysis: closing month total vs average of preceding months.
+    """Build variance from an uploaded balance report (BS or P&L).
 
+    balance_df has columns: Account, plus 'YYYY-MM' columns with balances.
     Returns (summary_df, preceding_labels, closing_label) or (None, None, None).
-    - summary_df has columns: Account, each preceding month total, Preceding Avg,
-      Closing Month total, Variance ($), Variance (%).
     """
+    if balance_df is None or balance_df.empty:
+        return None, None, None
+
+    month_cols = sorted([c for c in balance_df.columns if c != "Account" and re.match(r"\d{4}-\d{2}", c)])
+    if len(month_cols) < 2:
+        return None, None, None
+
+    # Map each column to its month number
+    col_months = {}
+    for c in month_cols:
+        yr, mon = int(c.split("-")[0]), int(c.split("-")[1])
+        col_months[c] = (yr, mon)
+
+    preceding_month_nums = _get_preceding_months(closing_month, start_month)
+
+    # Find closing and preceding columns
+    closing_cols = [c for c in month_cols if col_months[c][1] == closing_month]
+    preceding_cols = sorted([c for c in month_cols if col_months[c][1] in preceding_month_nums])
+
+    if not closing_cols or not preceding_cols:
+        return None, None, None
+
+    close_col = closing_cols[-1]  # most recent
+    closing_label = close_col
+
+    # Build summary: Account | each preceding month balance | Preceding Avg | Closing | Variance | Var %
+    records = []
+    for _, row in balance_df.iterrows():
+        acct = row["Account"]
+        rec = {"Account": acct}
+        prec_vals = []
+        for pc in preceding_cols:
+            val = row.get(pc, 0)
+            rec[pc] = val
+            prec_vals.append(val)
+        prec_avg = np.mean(prec_vals) if prec_vals else 0
+        close_val = row.get(close_col, 0)
+        variance = close_val - prec_avg
+        var_pct = (variance / abs(prec_avg)) if abs(prec_avg) > 0.01 else np.nan
+
+        rec["Preceding Avg"] = prec_avg
+        rec[f"Closing ({closing_label})"] = close_val
+        rec["Variance ($)"] = variance
+        rec["Variance (%)"] = var_pct
+        rec["_abs_var"] = abs(variance)
+        records.append(rec)
+
+    summary = pd.DataFrame(records)
+    summary = summary.sort_values("_abs_var", ascending=False).head(top_n)
+    summary = summary.drop(columns=["_abs_var"])
+    summary = summary.reset_index(drop=True)
+
+    return summary, preceding_cols, closing_label
+
+
+def _build_closing_variance_table_from_gl(gl: pd.DataFrame, account_type: str,
+                                           closing_month: int, start_month: int,
+                                           top_n: int = 20):
+    """Fallback: build variance from GL transactions when no balance file uploaded."""
     if "YearMonth" not in gl.columns or gl["YearMonth"].isna().all():
         return None, None, None
 
@@ -1010,22 +1217,16 @@ def _build_closing_variance_table(gl: pd.DataFrame, account_type: str,
     if not preceding_month_nums:
         return None, None, None
 
-    # Find the closing-month period(s) and preceding period(s) in the data
     closing_periods = [p for p in all_periods if p.month == closing_month]
     preceding_periods = [p for p in all_periods if p.month in preceding_month_nums]
-
     if not closing_periods or not preceding_periods:
         return None, None, None
 
-    # Use the most recent closing period
     close_p = closing_periods[-1]
     closing_label = str(close_p)
-
-    # Sort preceding periods chronologically
     preceding_periods = sorted(preceding_periods)
     preceding_labels = [str(p) for p in preceding_periods]
 
-    # Monthly totals per account
     all_relevant = preceding_periods + [close_p]
     monthly = (
         subset[subset["YearMonth"].isin(all_relevant)]
@@ -1034,64 +1235,48 @@ def _build_closing_variance_table(gl: pd.DataFrame, account_type: str,
         .unstack(fill_value=0)
     )
 
-    # Compute preceding average
-    if preceding_periods:
-        prec_cols = [p for p in preceding_periods if p in monthly.columns]
-        if prec_cols:
-            monthly["Preceding Avg"] = monthly[prec_cols].mean(axis=1)
-        else:
-            monthly["Preceding Avg"] = 0
-    else:
-        monthly["Preceding Avg"] = 0
-
-    # Closing month
-    if close_p in monthly.columns:
-        monthly["Closing Month"] = monthly[close_p]
-    else:
-        monthly["Closing Month"] = 0
-
-    # Variance = Closing Month - Preceding Average
+    prec_cols = [p for p in preceding_periods if p in monthly.columns]
+    monthly["Preceding Avg"] = monthly[prec_cols].mean(axis=1) if prec_cols else 0
+    monthly["Closing Month"] = monthly.get(close_p, 0)
     monthly["Variance"] = monthly["Closing Month"] - monthly["Preceding Avg"]
     monthly["Var_%"] = np.where(
         monthly["Preceding Avg"].abs() > 0.01,
-        monthly["Variance"] / monthly["Preceding Avg"].abs(),
-        np.nan,
-    )
+        monthly["Variance"] / monthly["Preceding Avg"].abs(), np.nan)
     monthly["Abs_Var"] = monthly["Variance"].abs()
-    monthly = monthly.sort_values("Abs_Var", ascending=False)
-    top = monthly.head(top_n)
+    monthly = monthly.sort_values("Abs_Var", ascending=False).head(top_n)
 
-    # Build summary
     records = []
-    for acct in top.index:
+    for acct in monthly.index:
         row = {"Account": acct}
         for p in preceding_periods:
-            row[str(p)] = top.at[acct, p] if p in top.columns else 0
-        row["Preceding Avg"] = top.at[acct, "Preceding Avg"]
-        row[f"Closing ({closing_label})"] = top.at[acct, "Closing Month"]
-        row["Variance ($)"] = top.at[acct, "Variance"]
-        row["Variance (%)"] = top.at[acct, "Var_%"]
+            row[str(p)] = monthly.at[acct, p] if p in monthly.columns else 0
+        row["Preceding Avg"] = monthly.at[acct, "Preceding Avg"]
+        row[f"Closing ({closing_label})"] = monthly.at[acct, "Closing Month"]
+        row["Variance ($)"] = monthly.at[acct, "Variance"]
+        row["Variance (%)"] = monthly.at[acct, "Var_%"]
         records.append(row)
 
-    summary = pd.DataFrame(records)
-    return summary, preceding_labels, closing_label
+    return pd.DataFrame(records), preceding_labels, closing_label
 
 
-def report_bs_variance(gl: pd.DataFrame, closing_month: int, start_month: int):
-    """Report 7 — Top 20 Balance Sheet Accounts: Closing Month vs Preceding Avg."""
+def _render_variance_report(summary, prec_labels, close_label, closing_month, start_month, report_type, source_label):
+    """Shared rendering for both BS and PL variance reports."""
     close_name = _MONTH_NAMES[closing_month - 1]
     start_name = _MONTH_NAMES[start_month - 1]
-    section(f"Top 20 Balance Sheet — {close_name} Close vs {start_name}–{_MONTH_NAMES[((closing_month - 2) % 12)]} Avg")
+    prev_name = _MONTH_NAMES[((closing_month - 2) % 12)]
+    type_label = "Balance Sheet" if report_type == "BS" else "Profit & Loss"
 
-    summary, prec_labels, close_label = _build_closing_variance_table(gl, "BS", closing_month, start_month, 20)
+    section(f"Top 20 {type_label} — {close_name} Close vs {start_name}–{prev_name} Avg")
 
     if summary is None or summary.empty:
-        st.warning("Could not identify enough Balance Sheet accounts or periods for variance analysis. "
-                    "Make sure the GL covers the selected closing and preceding months.")
+        st.warning(f"Could not build {type_label} variance analysis. "
+                   f"Upload a {type_label} balance file in the sidebar, or ensure the GL covers the selected months.")
         return
 
-    st.markdown(f"**Closing month:** {close_label} &nbsp;|&nbsp; **Preceding months:** {', '.join(prec_labels)}")
-    st.markdown("**Method:** Closing month total compared to average of preceding months")
+    st.markdown(f"**Source:** {source_label}")
+    st.markdown(f"**Closing month:** {close_label} &nbsp;|&nbsp; "
+                f"**Preceding months:** {', '.join(str(p) for p in prec_labels)}")
+    st.markdown("**Method:** Closing month balance compared to average of preceding months' balances")
 
     # Metric cards
     c1, c2, c3 = st.columns(3)
@@ -1130,61 +1315,27 @@ def report_bs_variance(gl: pd.DataFrame, closing_month: int, start_month: int):
         else:
             display[c] = display[c].map(lambda v: f"${v:,.2f}" if isinstance(v, (int, float)) else v)
     st.dataframe(display, use_container_width=True, hide_index=True)
+
+
+def report_bs_variance(gl: pd.DataFrame, closing_month: int, start_month: int, bs_balances=None):
+    """Report 7 — Top 20 Balance Sheet: uploaded balances or GL fallback."""
+    if bs_balances is not None and not bs_balances.empty:
+        summary, prec_labels, close_label = _build_balance_variance_table(
+            bs_balances, closing_month, start_month, 20)
+        source = "Uploaded Balance Sheet report"
+    else:
+        summary, prec_labels, close_label = _build_closing_variance_table_from_gl(
+            gl, "BS", closing_month, start_month, 20)
+        source = "Derived from General Ledger transactions (upload a BS balance file for actual balances)"
+    _render_variance_report(summary, prec_labels, close_label, closing_month, start_month, "BS", source)
 
 
 def report_pl_variance(gl: pd.DataFrame, closing_month: int, start_month: int):
-    """Report 8 — Top 20 P&L Accounts: Closing Month vs Preceding Avg."""
-    close_name = _MONTH_NAMES[closing_month - 1]
-    start_name = _MONTH_NAMES[start_month - 1]
-    section(f"Top 20 Profit & Loss — {close_name} Close vs {start_name}–{_MONTH_NAMES[((closing_month - 2) % 12)]} Avg")
-
-    summary, prec_labels, close_label = _build_closing_variance_table(gl, "PL", closing_month, start_month, 20)
-
-    if summary is None or summary.empty:
-        st.warning("Could not identify enough P&L accounts or periods for variance analysis. "
-                    "Make sure the GL covers the selected closing and preceding months.")
-        return
-
-    st.markdown(f"**Closing month:** {close_label} &nbsp;|&nbsp; **Preceding months:** {', '.join(prec_labels)}")
-    st.markdown("**Method:** Closing month total compared to average of preceding months")
-
-    # Metric cards
-    c1, c2, c3 = st.columns(3)
-    top_acct = summary.iloc[0]["Account"] if len(summary) > 0 else "N/A"
-    max_var = summary.iloc[0]["Variance ($)"] if len(summary) > 0 else 0
-    avg_var = summary["Variance ($)"].abs().mean()
-    with c1:
-        st.markdown(metric_card("Largest Variance", f"${abs(max_var):,.2f}"), unsafe_allow_html=True)
-    with c2:
-        st.markdown(metric_card("Top Account", str(top_acct)[:35]), unsafe_allow_html=True)
-    with c3:
-        st.markdown(metric_card("Avg Abs Variance", f"${avg_var:,.2f}"), unsafe_allow_html=True)
-
-    # Narrative
-    section("Variance Highlights")
-    for _, row in summary.head(5).iterrows():
-        acct = row["Account"]
-        var = row["Variance ($)"]
-        pct = row.get("Variance (%)", np.nan)
-        direction = "increased" if var > 0 else "decreased"
-        pct_str = f" ({abs(pct):.1%})" if pd.notna(pct) else ""
-        narrative(
-            f"<strong>{acct}</strong> {direction} by <strong>${abs(var):,.2f}</strong>{pct_str} "
-            f"in {close_label} compared to the preceding-months average of "
-            f"${row['Preceding Avg']:,.2f}."
-        )
-
-    # Detail table
-    section("Full Variance Detail")
-    display = summary.copy()
-    for c in display.columns:
-        if c == "Account":
-            continue
-        if c == "Variance (%)":
-            display[c] = display[c].map(lambda v: f"{v:.1%}" if pd.notna(v) else "—")
-        else:
-            display[c] = display[c].map(lambda v: f"${v:,.2f}" if isinstance(v, (int, float)) else v)
-    st.dataframe(display, use_container_width=True, hide_index=True)
+    """Report 8 — Top 20 P&L: derived from GL transactions."""
+    summary, prec_labels, close_label = _build_closing_variance_table_from_gl(
+        gl, "PL", closing_month, start_month, 20)
+    _render_variance_report(summary, prec_labels, close_label, closing_month, start_month, "PL",
+                            "Derived from General Ledger transactions")
 
 
 # ─────────────────────────────────────────────────────────────
@@ -1704,10 +1855,15 @@ def build_preflight_docx_data(gl: pd.DataFrame, coa: dict | None) -> dict:
 
 
 def _build_variance_docx_data(gl: pd.DataFrame, account_type: str, title: str,
-                               closing_month: int, start_month: int) -> dict:
+                               closing_month: int, start_month: int,
+                               balance_df=None) -> dict:
     """Build report_data for closing-vs-preceding variance report (BS or PL)."""
-    summary, prec_labels, close_label = _build_closing_variance_table(
-        gl, account_type, closing_month, start_month, 20)
+    if balance_df is not None and not balance_df.empty:
+        summary, prec_labels, close_label = _build_balance_variance_table(
+            balance_df, closing_month, start_month, 20)
+    else:
+        summary, prec_labels, close_label = _build_closing_variance_table_from_gl(
+            gl, account_type, closing_month, start_month, 20)
     if summary is None or summary.empty:
         return None
 
@@ -1759,17 +1915,18 @@ def _build_variance_docx_data(gl: pd.DataFrame, account_type: str, title: str,
     }
 
 
-def build_bs_variance_docx_data(gl: pd.DataFrame, closing_month: int, start_month: int) -> dict:
+def build_bs_variance_docx_data(gl, closing_month, start_month, bs_balances=None) -> dict:
     return _build_variance_docx_data(gl, "BS", "Top 20 Balance Sheet — Largest Variances",
-                                      closing_month, start_month)
+                                      closing_month, start_month, bs_balances)
 
 
-def build_pl_variance_docx_data(gl: pd.DataFrame, closing_month: int, start_month: int) -> dict:
+def build_pl_variance_docx_data(gl, closing_month, start_month) -> dict:
     return _build_variance_docx_data(gl, "PL", "Top 20 Profit & Loss — Largest Variances",
-                                      closing_month, start_month)
+                                      closing_month, start_month, None)
 
 
-def export_all_reports_docx(gl, coa, threshold, pdf_texts, closing_month=3, start_month=7):
+def export_all_reports_docx(gl, coa, threshold, pdf_texts, closing_month=3, start_month=7,
+                            bs_balances=None):
     """Generate all 8 reports as Word documents and return as a zip buffer."""
     import zipfile
 
@@ -1779,7 +1936,7 @@ def export_all_reports_docx(gl, coa, threshold, pdf_texts, closing_month=3, star
         "03_Suspense_Resolution": build_suspense_docx_data(gl, coa),
         "04_Materiality_Risk": build_materiality_docx_data(gl, threshold),
         "05_IIF_PreFlight": build_preflight_docx_data(gl, coa),
-        "07_BS_Top20_Variance": build_bs_variance_docx_data(gl, closing_month, start_month),
+        "07_BS_Top20_Variance": build_bs_variance_docx_data(gl, closing_month, start_month, bs_balances),
         "08_PL_Top20_Variance": build_pl_variance_docx_data(gl, closing_month, start_month),
     }
 
@@ -1846,7 +2003,8 @@ def export_all_reports_docx(gl, coa, threshold, pdf_texts, closing_month=3, star
 # ─────────────────────────────────────────────────────────────
 
 def export_all_reports_xlsx(gl: pd.DataFrame, coa, threshold: float, pdf_texts: list,
-                            closing_month: int = 3, start_month: int = 7) -> io.BytesIO:
+                            closing_month: int = 3, start_month: int = 7,
+                            bs_balances=None) -> io.BytesIO:
     """Generate all 8 reports as sheets in a single styled Excel workbook."""
     from openpyxl import Workbook
     from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
@@ -2134,7 +2292,10 @@ def export_all_reports_xlsx(gl: pd.DataFrame, coa, threshold: float, pdf_texts: 
     # ────────────────────────────────────────
     # Sheet 7: BS Top 20 Variance (Closing vs Preceding Avg)
     # ────────────────────────────────────────
-    summary_bs, prec_bs, close_bs = _build_closing_variance_table(gl, "BS", closing_month, start_month, 20)
+    if bs_balances is not None and not bs_balances.empty:
+        summary_bs, prec_bs, close_bs = _build_balance_variance_table(bs_balances, closing_month, start_month, 20)
+    else:
+        summary_bs, prec_bs, close_bs = _build_closing_variance_table_from_gl(gl, "BS", closing_month, start_month, 20)
     if summary_bs is not None and not summary_bs.empty:
         close_name = _MONTH_NAMES[closing_month - 1]
         start_name = _MONTH_NAMES[start_month - 1]
@@ -2165,7 +2326,7 @@ def export_all_reports_xlsx(gl: pd.DataFrame, coa, threshold: float, pdf_texts: 
     # ────────────────────────────────────────
     # Sheet 8: P&L Top 20 Variance (Closing vs Preceding Avg)
     # ────────────────────────────────────────
-    summary_pl, prec_pl, close_pl = _build_closing_variance_table(gl, "PL", closing_month, start_month, 20)
+    summary_pl, prec_pl, close_pl = _build_closing_variance_table_from_gl(gl, "PL", closing_month, start_month, 20)
     if summary_pl is not None and not summary_pl.empty:
         close_name = _MONTH_NAMES[closing_month - 1]
         start_name = _MONTH_NAMES[start_month - 1]
@@ -2236,6 +2397,16 @@ def main():
         )
 
         st.markdown("---")
+        st.markdown("### Balance Uploads")
+        st.caption("Monthly balance reports for variance analysis (Reports 7 & 8).")
+        bs_balance_file = st.file_uploader(
+            "Balance Sheet Balances",
+            type=["csv", "xlsx", "xls"],
+            help="Monthly balance sheet report — accounts as rows, months as columns. "
+                 "QuickBooks: Reports → Company & Financial → Balance Sheet Standard → Monthly.",
+        )
+
+        st.markdown("---")
         st.markdown("### Period Settings")
 
         _month_names = ["January","February","March","April","May","June",
@@ -2278,6 +2449,7 @@ def main():
     gl = None
     coa = None
     pdf_texts = []
+    bs_balances = None
 
     if gl_file:
         with st.spinner("Parsing General Ledger..."):
@@ -2300,6 +2472,16 @@ def main():
             if txt.strip():
                 pdf_texts.append(txt)
         st.sidebar.success(f"{len(pdf_texts)} PDF(s) extracted")
+
+    if bs_balance_file:
+        with st.spinner("Parsing Balance Sheet balances..."):
+            bs_balances = parse_balance_report(bs_balance_file)
+        if bs_balances is not None:
+            month_cols = [c for c in bs_balances.columns if c != "Account"]
+            st.sidebar.success(f"BS balances loaded — {len(bs_balances)} accounts, {len(month_cols)} months")
+        else:
+            st.sidebar.warning("Could not parse BS balance file. Check format: accounts as rows, months as columns.")
+
 
     # ── Guard ──
     if gl is None:
@@ -2346,7 +2528,7 @@ def main():
         report_reconciliation(gl, pdf_texts)
 
     with tabs[6]:
-        report_bs_variance(gl, closing_month, start_month)
+        report_bs_variance(gl, closing_month, start_month, bs_balances)
 
     with tabs[7]:
         report_pl_variance(gl, closing_month, start_month)
@@ -2358,7 +2540,7 @@ def main():
         if st.button("Generate All Reports as .docx", type="primary"):
             with st.spinner("Generating Apple-branded Word documents..."):
                 try:
-                    zip_buf, generated = export_all_reports_docx(gl, coa, threshold, pdf_texts, closing_month, start_month)
+                    zip_buf, generated = export_all_reports_docx(gl, coa, threshold, pdf_texts, closing_month, start_month, bs_balances)
                     st.success(f"Generated {len(generated)} report(s).")
                     st.download_button(
                         label="Download All Reports (.zip)",
@@ -2376,7 +2558,7 @@ def main():
         if st.button("Generate All Reports as .xlsx", type="primary"):
             with st.spinner("Building Excel workbook..."):
                 try:
-                    xlsx_buf = export_all_reports_xlsx(gl, coa, threshold, pdf_texts, closing_month, start_month)
+                    xlsx_buf = export_all_reports_xlsx(gl, coa, threshold, pdf_texts, closing_month, start_month, bs_balances)
                     st.success("Excel workbook generated with all 8 reports.")
                     st.download_button(
                         label="Download Excel Workbook (.xlsx)",
