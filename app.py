@@ -1739,6 +1739,318 @@ def export_all_reports_docx(gl, coa, threshold, pdf_texts):
 
 
 # ─────────────────────────────────────────────────────────────
+# 5c · EXCEL EXPORT ENGINE
+# ─────────────────────────────────────────────────────────────
+
+def export_all_reports_xlsx(gl: pd.DataFrame, coa, threshold: float, pdf_texts: list) -> io.BytesIO:
+    """Generate all 8 reports as sheets in a single styled Excel workbook."""
+    from openpyxl import Workbook
+    from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
+    from openpyxl.utils import get_column_letter
+
+    wb = Workbook()
+    # Remove the default sheet — we'll create named ones
+    wb.remove(wb.active)
+
+    # ── Style constants ──
+    hdr_font = Font(name="Arial", bold=True, size=10, color="FFFFFF")
+    hdr_fill = PatternFill("solid", fgColor="0071E3")
+    hdr_align = Alignment(horizontal="center", vertical="center", wrap_text=True)
+    data_font = Font(name="Arial", size=10)
+    curr_fmt = '#,##0.00;(#,##0.00);"-"'
+    pct_fmt = '0.0%;(0.0%);"-"'
+    thin_border = Border(
+        left=Side(style="thin", color="D2D2D7"),
+        right=Side(style="thin", color="D2D2D7"),
+        top=Side(style="thin", color="D2D2D7"),
+        bottom=Side(style="thin", color="D2D2D7"),
+    )
+    alt_fill = PatternFill("solid", fgColor="F5F5F7")
+    title_font = Font(name="Arial", bold=True, size=14, color="0071E3")
+    subtitle_font = Font(name="Arial", size=10, color="6E6E73")
+
+    def _add_title_block(ws, title, subtitle=""):
+        ws.append([title])
+        ws.cell(row=1, column=1).font = title_font
+        ws.append([subtitle])
+        ws.cell(row=2, column=1).font = subtitle_font
+        ws.append([f"Generated {datetime.date.today().strftime('%d %b %Y')}"])
+        ws.cell(row=3, column=1).font = subtitle_font
+        ws.append([])  # blank row
+
+    def _write_table(ws, headers, rows, start_row=None):
+        if start_row is None:
+            start_row = ws.max_row + 1
+        # Headers
+        for ci, h in enumerate(headers, 1):
+            cell = ws.cell(row=start_row, column=ci, value=h)
+            cell.font = hdr_font
+            cell.fill = hdr_fill
+            cell.alignment = hdr_align
+            cell.border = thin_border
+        # Data rows
+        for ri, row_data in enumerate(rows):
+            excel_row = start_row + 1 + ri
+            for ci, val in enumerate(row_data, 1):
+                cell = ws.cell(row=excel_row, column=ci, value=val)
+                cell.font = data_font
+                cell.border = thin_border
+                cell.alignment = Alignment(horizontal="right" if ci > 1 else "left",
+                                           vertical="center")
+                if ri % 2 == 1:
+                    cell.fill = alt_fill
+        # Auto-width
+        for ci in range(1, len(headers) + 1):
+            max_len = len(str(headers[ci - 1]))
+            for ri in range(len(rows)):
+                cell_val = str(rows[ri][ci - 1]) if ci - 1 < len(rows[ri]) else ""
+                max_len = max(max_len, len(cell_val))
+            ws.column_dimensions[get_column_letter(ci)].width = min(max_len + 3, 40)
+        return start_row + 1 + len(rows)
+
+    def _add_section_heading(ws, text):
+        row = ws.max_row + 2
+        cell = ws.cell(row=row, column=1, value=text)
+        cell.font = Font(name="Arial", bold=True, size=11, color="0071E3")
+        return row
+
+    # ────────────────────────────────────────
+    # Sheet 1: Flux Narrative
+    # ────────────────────────────────────────
+    if "YearMonth" in gl.columns and not gl["YearMonth"].isna().all():
+        periods = sorted(gl["YearMonth"].dropna().unique())
+        if len(periods) >= 2:
+            ws = wb.create_sheet("1-Flux Narrative")
+            curr, prev = periods[-1], periods[-2]
+            _add_title_block(ws, "Flux (Variance) Narrative", f"{prev} vs {curr}")
+
+            curr_df = gl[gl["YearMonth"] == curr]
+            prev_df = gl[gl["YearMonth"] == prev]
+            curr_totals = curr_df.groupby("Account")["Amount"].sum()
+            prev_totals = prev_df.groupby("Account")["Amount"].sum()
+            flux = pd.DataFrame({"Current": curr_totals, "Prior": prev_totals}).fillna(0)
+            flux["Variance"] = flux["Current"] - flux["Prior"]
+            flux["Var_%"] = np.where(flux["Prior"] != 0, flux["Variance"] / flux["Prior"].abs(), np.nan)
+            flux = flux.sort_values("Variance", key=abs, ascending=False)
+
+            headers = ["Account", "Current ($)", "Prior ($)", "Variance ($)", "Var %"]
+            rows = []
+            for acct, r in flux.iterrows():
+                rows.append([
+                    str(acct),
+                    round(r["Current"], 2),
+                    round(r["Prior"], 2),
+                    round(r["Variance"], 2),
+                    round(r["Var_%"], 4) if pd.notna(r["Var_%"]) else None,
+                ])
+            _write_table(ws, headers, rows)
+            # Format currency and percent columns
+            for ri in range(len(rows)):
+                for ci in [2, 3, 4]:
+                    ws.cell(row=5 + ri, column=ci).number_format = curr_fmt
+                ws.cell(row=5 + ri, column=5).number_format = pct_fmt
+
+    # ────────────────────────────────────────
+    # Sheet 2: Missing Bills
+    # ────────────────────────────────────────
+    if "Name" in gl.columns and "YearMonth" in gl.columns:
+        vendors = gl[gl["Name"].str.strip() != "nan"].copy()
+        if not vendors.empty:
+            periods = sorted(vendors["YearMonth"].dropna().unique())
+            if len(periods) >= 3:
+                ws = wb.create_sheet("2-Missing Bills")
+                curr = periods[-1]
+                _add_title_block(ws, "Recurring Vendor Gap Analysis", f"Current period: {curr}")
+                history = vendors[vendors["YearMonth"] != curr]
+                curr_vendors = set(vendors[vendors["YearMonth"] == curr]["Name"].unique())
+                total_hist = len(periods) - 1
+                vendor_periods = history.groupby("Name")["YearMonth"].nunique()
+                recurring = vendor_periods[vendor_periods >= max(2, total_hist * 0.5)]
+                missing = [v for v in recurring.index if v not in curr_vendors and str(v).strip() and str(v) != "nan"]
+
+                headers = ["Vendor", "Frequency", "Avg Amount ($)", "Last Seen", "Typical Account", "Suggested Accrual ($)"]
+                rows = []
+                for v in missing:
+                    v_hist = history[history["Name"] == v]
+                    avg_amt = v_hist["Credit"].mean()
+                    last_date = v_hist["Date"].max()
+                    freq = v_hist["YearMonth"].nunique()
+                    typical_acct = v_hist["Account"].mode().iloc[0] if not v_hist["Account"].mode().empty else "Unknown"
+                    rows.append([
+                        str(v),
+                        f"{freq}/{total_hist}",
+                        round(avg_amt, 2) if pd.notna(avg_amt) else 0,
+                        str(last_date.date()) if pd.notna(last_date) else "",
+                        str(typical_acct),
+                        round(avg_amt, 2) if pd.notna(avg_amt) else 0,
+                    ])
+                _write_table(ws, headers, rows)
+                for ri in range(len(rows)):
+                    for ci in [3, 6]:
+                        ws.cell(row=5 + ri, column=ci).number_format = curr_fmt
+
+    # ────────────────────────────────────────
+    # Sheet 3: Suspense Reclass
+    # ────────────────────────────────────────
+    suspense_kw = r"(?i)(suspense|clearing|misc|miscellaneous|unclassified|uncategorized|ask\s*my\s*account|other)"
+    susp_txns = gl[gl["Account"].str.contains(suspense_kw, na=False)]
+    if not susp_txns.empty:
+        ws = wb.create_sheet("3-Suspense Reclass")
+        _add_title_block(ws, "Suspense & Misc Resolution Worksheet")
+        headers = ["Date", "Account", "Name", "Memo", "Debit ($)", "Credit ($)", "Suggested Reclass"]
+        rows = []
+        for _, txn in susp_txns.head(100).iterrows():
+            rows.append([
+                str(txn.get("Date", ""))[:10],
+                str(txn.get("Account", "")),
+                str(txn.get("Name", "")),
+                str(txn.get("Memo", "")),
+                round(txn.get("Debit", 0), 2),
+                round(txn.get("Credit", 0), 2),
+                "",  # blank for user to fill
+            ])
+        _write_table(ws, headers, rows)
+        for ri in range(len(rows)):
+            for ci in [5, 6]:
+                ws.cell(row=5 + ri, column=ci).number_format = curr_fmt
+
+    # ────────────────────────────────────────
+    # Sheet 4: Materiality & Risk
+    # ────────────────────────────────────────
+    ws = wb.create_sheet("4-Materiality Risk")
+    _add_title_block(ws, "Materiality & Risk Threshold", f"Threshold: ${threshold:,.0f}")
+    material = gl[gl["Amount"].abs() >= threshold].sort_values("Amount", key=abs, ascending=False)
+    headers = ["Date", "Account", "Name", "Amount ($)", "Risk Level", "Reason"]
+    rows = []
+    for _, txn in material.head(100).iterrows():
+        risk = "Medium"
+        reason = "Material amount"
+        if abs(txn["Amount"]) >= threshold * 5:
+            risk = "High"
+            reason = "Exceeds 5x threshold"
+        elif abs(txn["Amount"]) >= threshold * 2:
+            risk = "Medium"
+            reason = "Exceeds 2x threshold"
+        rows.append([
+            str(txn.get("Date", ""))[:10],
+            str(txn.get("Account", "")),
+            str(txn.get("Name", "")),
+            round(txn["Amount"], 2),
+            risk,
+            reason,
+        ])
+    _write_table(ws, headers, rows)
+    for ri in range(len(rows)):
+        ws.cell(row=5 + ri, column=4).number_format = curr_fmt
+
+    # ────────────────────────────────────────
+    # Sheet 5: IIF Pre-Flight
+    # ────────────────────────────────────────
+    ws = wb.create_sheet("5-IIF PreFlight")
+    _add_title_block(ws, "IIF Import Pre-Flight Validation")
+    checks = []
+    if "YearMonth" in gl.columns:
+        for period in sorted(gl["YearMonth"].dropna().unique()):
+            p_df = gl[gl["YearMonth"] == period]
+            total_dr, total_cr = p_df["Debit"].sum(), p_df["Credit"].sum()
+            diff = abs(total_dr - total_cr)
+            checks.append([
+                f"Debits = Credits ({period})",
+                "PASS" if diff < 0.01 else "FAIL",
+                f"DR: ${total_dr:,.2f} | CR: ${total_cr:,.2f} | Diff: ${diff:,.2f}",
+            ])
+    blank_accts = gl["Account"].isna().sum() + (gl["Account"] == "").sum() + (gl["Account"] == "nan").sum()
+    checks.append(["No Blank Accounts", "PASS" if blank_accts == 0 else "FAIL", f"{blank_accts} blank account(s)"])
+    headers = ["Check", "Status", "Detail"]
+    _write_table(ws, headers, checks)
+    # Color the status cells
+    pass_fill = PatternFill("solid", fgColor="D4EDDA")
+    fail_fill = PatternFill("solid", fgColor="F8D7DA")
+    for ri in range(len(checks)):
+        cell = ws.cell(row=5 + ri, column=2)
+        cell.fill = pass_fill if cell.value == "PASS" else fail_fill
+
+    # ────────────────────────────────────────
+    # Sheet 6: Reconciliation
+    # ────────────────────────────────────────
+    ws = wb.create_sheet("6-Reconciliation")
+    _add_title_block(ws, "Multi-Source Reconciliation Summary")
+    bank_kw = r"(?i)(bank|cash|checking|savings|operating|deposit)"
+    bank_gl = gl[gl["Account"].str.contains(bank_kw, na=False)]
+    tax_kw = r"(?i)(sales\s*tax|tax|shipping|freight|delivery|handling)"
+    tax_txns = gl[gl["Memo"].str.contains(tax_kw, na=False) | gl["Account"].str.contains(tax_kw, na=False)]
+
+    _add_section_heading(ws, "Overview")
+    r = ws.max_row + 1
+    ws.cell(row=r, column=1, value=f"GL bank transactions: {len(bank_gl):,}").font = data_font
+    ws.cell(row=r + 1, column=1, value=f"PDFs uploaded: {len(pdf_texts)}").font = data_font
+    ws.cell(row=r + 2, column=1, value=f"Tax/shipping entries: {len(tax_txns)}").font = data_font
+
+    _add_section_heading(ws, "Tax & Shipping Line Items")
+    headers = ["Date", "Account", "Memo", "Debit ($)", "Credit ($)"]
+    rows = []
+    for _, txn in tax_txns.head(50).iterrows():
+        rows.append([
+            str(txn.get("Date", ""))[:10],
+            str(txn.get("Account", "")),
+            str(txn.get("Memo", "")),
+            round(txn.get("Debit", 0), 2),
+            round(txn.get("Credit", 0), 2),
+        ])
+    if rows:
+        sr = _write_table(ws, headers, rows)
+        for ri in range(len(rows)):
+            for ci in [4, 5]:
+                ws.cell(row=ws.max_row - len(rows) + ri + 1, column=ci).number_format = curr_fmt
+
+    # ────────────────────────────────────────
+    # Sheet 7: BS Top 20 Variance
+    # ────────────────────────────────────────
+    summary_bs, detail_bs, labels_bs = _build_monthly_variance_table(gl, "BS", 20)
+    if summary_bs is not None and not summary_bs.empty:
+        ws = wb.create_sheet("7-BS Top20 Variance")
+        _add_title_block(ws, "Top 20 Balance Sheet — Largest Variances", "July–February Month-over-Month")
+        headers = ["Account"] + labels_bs + ["Max Variance ($)"]
+        rows = []
+        for _, row in summary_bs.iterrows():
+            r = [str(row["Account"])]
+            for ml in labels_bs:
+                r.append(round(row.get(ml, 0), 2) if isinstance(row.get(ml, 0), (int, float)) else 0)
+            r.append(round(row["Max Variance"], 2) if isinstance(row["Max Variance"], (int, float)) else 0)
+            rows.append(r)
+        next_row = _write_table(ws, headers, rows)
+        for ri in range(len(rows)):
+            for ci in range(2, len(headers) + 1):
+                ws.cell(row=5 + ri, column=ci).number_format = curr_fmt
+
+    # ────────────────────────────────────────
+    # Sheet 8: P&L Top 20 Variance
+    # ────────────────────────────────────────
+    summary_pl, detail_pl, labels_pl = _build_monthly_variance_table(gl, "PL", 20)
+    if summary_pl is not None and not summary_pl.empty:
+        ws = wb.create_sheet("8-PL Top20 Variance")
+        _add_title_block(ws, "Top 20 Profit & Loss — Largest Variances", "July–February Month-over-Month")
+        headers = ["Account"] + labels_pl + ["Max Variance ($)"]
+        rows = []
+        for _, row in summary_pl.iterrows():
+            r = [str(row["Account"])]
+            for ml in labels_pl:
+                r.append(round(row.get(ml, 0), 2) if isinstance(row.get(ml, 0), (int, float)) else 0)
+            r.append(round(row["Max Variance"], 2) if isinstance(row["Max Variance"], (int, float)) else 0)
+            rows.append(r)
+        _write_table(ws, headers, rows)
+        for ri in range(len(rows)):
+            for ci in range(2, len(headers) + 1):
+                ws.cell(row=5 + ri, column=ci).number_format = curr_fmt
+
+    # ── Write to buffer ──
+    buf = io.BytesIO()
+    wb.save(buf)
+    buf.seek(0)
+    return buf
+
+
+# ─────────────────────────────────────────────────────────────
 # 6 · MAIN APPLICATION
 # ─────────────────────────────────────────────────────────────
 
@@ -1789,6 +2101,8 @@ def main():
         export_iif = st.checkbox("Enable IIF Export", value=False)
         export_docx = st.checkbox("Export Reports as Word (.docx)", value=False,
                                   help="Generate Apple-branded Word documents for all 8 reports.")
+        export_xlsx = st.checkbox("Export Reports as Excel (.xlsx)", value=False,
+                                  help="Generate a multi-sheet Excel workbook with all 8 reports.")
 
     # ── Parse data ──
     gl = None
@@ -1884,6 +2198,24 @@ def main():
                     )
                 except Exception as e:
                     st.error(f"Export failed: {e}")
+
+    # ── Excel Export ──
+    if export_xlsx:
+        st.markdown("---")
+        section("Excel Workbook Export")
+        if st.button("Generate All Reports as .xlsx", type="primary"):
+            with st.spinner("Building Excel workbook..."):
+                try:
+                    xlsx_buf = export_all_reports_xlsx(gl, coa, threshold, pdf_texts)
+                    st.success("Excel workbook generated with all 8 reports.")
+                    st.download_button(
+                        label="Download Excel Workbook (.xlsx)",
+                        data=xlsx_buf,
+                        file_name=f"MonthEnd_Reports_{datetime.date.today().isoformat()}.xlsx",
+                        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                    )
+                except Exception as e:
+                    st.error(f"Excel export failed: {e}")
 
     # ── IIF Export ──
     if export_iif:
