@@ -10,6 +10,8 @@ Reports:
   4. Materiality & Risk Threshold
   5. IIF Import Pre-Flight Validation
   6. Multi-Source Reconciliation Summary
+  7. Top 20 Balance Sheet Accounts — Largest Variances (July–February)
+  8. Top 20 Profit & Loss Accounts — Largest Variances (July–February)
 """
 
 import streamlit as st
@@ -882,6 +884,225 @@ def report_reconciliation(gl: pd.DataFrame, pdf_texts: list[str]):
 
 
 # ─────────────────────────────────────────────────────────────
+# 3b · MULTI-MONTH VARIANCE REPORTS (July–February)
+# ─────────────────────────────────────────────────────────────
+
+# Balance-sheet keywords (assets, liabilities, equity)
+_BS_KW = re.compile(
+    r"(?i)(cash|bank|checking|savings|accounts?\s*receivable|a/?r|"
+    r"inventory|prepaid|fixed\s*asset|equipment|furniture|"
+    r"accumulated\s*depreciation|depreciation|"
+    r"accounts?\s*payable|a/?p|accrued|loan|note|"
+    r"credit\s*card|line\s*of\s*credit|mortgage|"
+    r"equity|retained\s*earnings|owner|capital|"
+    r"undeposited|other\s*current\s*asset|other\s*asset|"
+    r"other\s*current\s*liabilit)"
+)
+
+# P&L keywords (revenue + expenses)
+_PL_KW = re.compile(
+    r"(?i)(income|revenue|sales|service|"
+    r"cost\s*of\s*goods|cogs|cost\s*of\s*sales|"
+    r"expense|rent|utilities|payroll|wage|salar|"
+    r"insurance|supplies|office|travel|meal|"
+    r"advertising|marketing|professional\s*fee|"
+    r"repair|maintenance|tax|interest\s*expense|"
+    r"depreciation\s*expense|amortization|"
+    r"telephone|internet|shipping|freight|"
+    r"commission|contractor|subcontract|"
+    r"dues|subscription|license|training|"
+    r"auto|vehicle|fuel|gas|"
+    r"misc|other\s*income|other\s*expense|"
+    r"gain|loss|discount)"
+)
+
+
+def _classify_account(acct_name: str) -> str:
+    """Return 'BS', 'PL', or 'Unknown' based on account name keywords."""
+    if _BS_KW.search(acct_name):
+        return "BS"
+    if _PL_KW.search(acct_name):
+        return "PL"
+    return "Unknown"
+
+
+def _build_monthly_variance_table(gl: pd.DataFrame, account_type: str, top_n: int = 20):
+    """Build a month-over-month variance analysis for the given account type.
+
+    Looks at July through February of the data range.
+    Returns (summary_df, detail_records, month_labels) or (None, None, None).
+    """
+    if "YearMonth" not in gl.columns or gl["YearMonth"].isna().all():
+        return None, None, None
+
+    # Classify accounts
+    gl = gl.copy()
+    if "AcctClass" not in gl.columns:
+        gl["AcctClass"] = gl["Account"].apply(_classify_account)
+
+    subset = gl[gl["AcctClass"] == account_type]
+    if subset.empty:
+        return None, None, None
+
+    periods = sorted(subset["YearMonth"].dropna().unique())
+    if len(periods) < 2:
+        return None, None, None
+
+    # Filter to July–February window within the data range
+    target_months = {7, 8, 9, 10, 11, 12, 1, 2}
+    periods = [p for p in periods if p.month in target_months]
+    if len(periods) < 2:
+        # Fall back to all periods if no July–Feb data
+        periods = sorted(subset["YearMonth"].dropna().unique())
+
+    # Monthly totals per account
+    monthly = (
+        subset[subset["YearMonth"].isin(periods)]
+        .groupby(["Account", "YearMonth"])["Amount"]
+        .sum()
+        .unstack(fill_value=0)
+    )
+
+    # Compute month-over-month variances
+    variance_cols = []
+    month_labels = []
+    for i in range(1, len(periods)):
+        prev_p, curr_p = periods[i - 1], periods[i]
+        col_name = f"{prev_p}→{curr_p}"
+        monthly[col_name] = monthly.get(curr_p, 0) - monthly.get(prev_p, 0)
+        variance_cols.append(col_name)
+        month_labels.append(col_name)
+
+    if not variance_cols:
+        return None, None, None
+
+    # Max absolute variance across all months for each account
+    monthly["Max_Abs_Var"] = monthly[variance_cols].abs().max(axis=1)
+    monthly = monthly.sort_values("Max_Abs_Var", ascending=False)
+    top = monthly.head(top_n)
+
+    # Build detail records for display
+    detail = []
+    for acct in top.index:
+        row = {"Account": acct}
+        for p in periods:
+            row[str(p)] = top.at[acct, p] if p in top.columns else 0
+        for vc in variance_cols:
+            row[vc] = top.at[acct, vc]
+        row["Max Variance"] = top.at[acct, "Max_Abs_Var"]
+        detail.append(row)
+
+    summary = pd.DataFrame(detail)
+    return summary, detail, month_labels
+
+
+def report_bs_variance(gl: pd.DataFrame):
+    """Report 7 — Top 20 Balance Sheet Accounts by Largest Variance."""
+    section("Top 20 Balance Sheet — Largest Month-to-Month Variances")
+
+    summary, detail, month_labels = _build_monthly_variance_table(gl, "BS", 20)
+
+    if summary is None or summary.empty:
+        st.warning("Could not identify enough Balance Sheet accounts or periods for variance analysis.")
+        return
+
+    st.markdown("**Analysis window:** July through February (month-over-month variances)")
+    st.markdown(f"**Accounts analyzed:** Top 20 by largest single-month variance")
+
+    # Metric cards
+    c1, c2, c3 = st.columns(3)
+    top_acct = summary.iloc[0]["Account"] if len(summary) > 0 else "N/A"
+    max_var = summary.iloc[0]["Max Variance"] if len(summary) > 0 else 0
+    avg_max = summary["Max Variance"].mean()
+    with c1:
+        st.markdown(metric_card("Largest Swing", f"${max_var:,.2f}"), unsafe_allow_html=True)
+    with c2:
+        st.markdown(metric_card("Top Account", str(top_acct)[:35]), unsafe_allow_html=True)
+    with c3:
+        st.markdown(metric_card("Avg Peak Variance", f"${avg_max:,.2f}"), unsafe_allow_html=True)
+
+    # Narrative
+    section("Variance Highlights")
+    for _, row in summary.head(5).iterrows():
+        acct = row["Account"]
+        # Find the month with the largest swing
+        max_col = None
+        max_val = 0
+        for ml in month_labels:
+            if abs(row.get(ml, 0)) > abs(max_val):
+                max_val = row.get(ml, 0)
+                max_col = ml
+        direction = "increased" if max_val > 0 else "decreased"
+        narrative(
+            f"<strong>{acct}</strong> had its largest swing of "
+            f"<strong>${abs(max_val):,.2f}</strong> during {max_col}, "
+            f"where the balance {direction}. Peak absolute variance across all months: "
+            f"${row['Max Variance']:,.2f}."
+        )
+
+    # Detail table
+    section("Full Variance Detail")
+    display = summary.copy()
+    # Format currency columns
+    for c in display.columns:
+        if c not in ("Account",):
+            display[c] = display[c].map(lambda v: f"${v:,.2f}" if isinstance(v, (int, float)) else v)
+    st.dataframe(display, use_container_width=True, hide_index=True)
+
+
+def report_pl_variance(gl: pd.DataFrame):
+    """Report 8 — Top 20 Profit & Loss Accounts by Largest Variance."""
+    section("Top 20 Profit & Loss — Largest Month-to-Month Variances")
+
+    summary, detail, month_labels = _build_monthly_variance_table(gl, "PL", 20)
+
+    if summary is None or summary.empty:
+        st.warning("Could not identify enough P&L accounts or periods for variance analysis.")
+        return
+
+    st.markdown("**Analysis window:** July through February (month-over-month variances)")
+    st.markdown(f"**Accounts analyzed:** Top 20 by largest single-month variance")
+
+    # Metric cards
+    c1, c2, c3 = st.columns(3)
+    top_acct = summary.iloc[0]["Account"] if len(summary) > 0 else "N/A"
+    max_var = summary.iloc[0]["Max Variance"] if len(summary) > 0 else 0
+    avg_max = summary["Max Variance"].mean()
+    with c1:
+        st.markdown(metric_card("Largest Swing", f"${max_var:,.2f}"), unsafe_allow_html=True)
+    with c2:
+        st.markdown(metric_card("Top Account", str(top_acct)[:35]), unsafe_allow_html=True)
+    with c3:
+        st.markdown(metric_card("Avg Peak Variance", f"${avg_max:,.2f}"), unsafe_allow_html=True)
+
+    # Narrative
+    section("Variance Highlights")
+    for _, row in summary.head(5).iterrows():
+        acct = row["Account"]
+        max_col = None
+        max_val = 0
+        for ml in month_labels:
+            if abs(row.get(ml, 0)) > abs(max_val):
+                max_val = row.get(ml, 0)
+                max_col = ml
+        direction = "increased" if max_val > 0 else "decreased"
+        narrative(
+            f"<strong>{acct}</strong> had its largest swing of "
+            f"<strong>${abs(max_val):,.2f}</strong> during {max_col}, "
+            f"where spending {direction}. Peak absolute variance across all months: "
+            f"${row['Max Variance']:,.2f}."
+        )
+
+    # Detail table
+    section("Full Variance Detail")
+    display = summary.copy()
+    for c in display.columns:
+        if c not in ("Account",):
+            display[c] = display[c].map(lambda v: f"${v:,.2f}" if isinstance(v, (int, float)) else v)
+    st.dataframe(display, use_container_width=True, hide_index=True)
+
+
+# ─────────────────────────────────────────────────────────────
 # 4 · IIF EXPORT ENGINE
 # ─────────────────────────────────────────────────────────────
 
@@ -1381,8 +1602,72 @@ def build_preflight_docx_data(gl: pd.DataFrame, coa: dict | None) -> dict:
     }
 
 
+def _build_variance_docx_data(gl: pd.DataFrame, account_type: str, title: str) -> dict:
+    """Build report_data for a multi-month variance report (BS or PL)."""
+    summary, detail, month_labels = _build_monthly_variance_table(gl, account_type, 20)
+    if summary is None or summary.empty:
+        return None
+
+    # Narratives for top 5
+    narratives = []
+    for _, row in summary.head(5).iterrows():
+        acct = row["Account"]
+        max_col = None
+        max_val = 0
+        for ml in month_labels:
+            if abs(row.get(ml, 0)) > abs(max_val):
+                max_val = row.get(ml, 0)
+                max_col = ml
+        direction = "increased" if max_val > 0 else "decreased"
+        narratives.append(
+            f"{acct} had its largest swing of ${abs(max_val):,.2f} during {max_col}, "
+            f"where the balance {direction}. Peak absolute variance: ${row['Max Variance']:,.2f}."
+        )
+
+    # Table rows — Account + each month-over-month variance + Max Variance
+    headers = ["Account"] + month_labels + ["Max Variance"]
+    table_rows = []
+    for _, row in summary.iterrows():
+        r = [str(row["Account"])[:40]]
+        for ml in month_labels:
+            v = row.get(ml, 0)
+            r.append(f"${v:,.2f}" if isinstance(v, (int, float)) else str(v))
+        r.append(f"${row['Max Variance']:,.2f}" if isinstance(row["Max Variance"], (int, float)) else str(row["Max Variance"]))
+        table_rows.append(r)
+
+    return {
+        "title": title,
+        "subtitle": f"Organization  |  July–February Month-over-Month Analysis",
+        "date": datetime.date.today().strftime("%d %b %Y"),
+        "sections": [
+            {"heading": "Summary",
+             "paragraphs": [
+                 f"Top 20 {account_type} accounts ranked by largest single-month variance.",
+                 f"Analysis covers {len(month_labels)} month-over-month transitions.",
+             ]},
+            {"heading": "Variance Highlights", "paragraphs": narratives},
+            {"heading": "Full Variance Detail",
+             "paragraphs": [],
+             "table": {
+                 "headers": headers,
+                 "rows": table_rows,
+             }},
+        ],
+    }
+
+
+def build_bs_variance_docx_data(gl: pd.DataFrame) -> dict:
+    """Build report_data for BS variance report."""
+    return _build_variance_docx_data(gl, "BS", "Top 20 Balance Sheet — Largest Variances")
+
+
+def build_pl_variance_docx_data(gl: pd.DataFrame) -> dict:
+    """Build report_data for P&L variance report."""
+    return _build_variance_docx_data(gl, "PL", "Top 20 Profit & Loss — Largest Variances")
+
+
 def export_all_reports_docx(gl, coa, threshold, pdf_texts):
-    """Generate all 6 reports as Word documents and return as a zip buffer."""
+    """Generate all 8 reports as Word documents and return as a zip buffer."""
     import zipfile
 
     reports = {
@@ -1391,6 +1676,8 @@ def export_all_reports_docx(gl, coa, threshold, pdf_texts):
         "03_Suspense_Resolution": build_suspense_docx_data(gl, coa),
         "04_Materiality_Risk": build_materiality_docx_data(gl, threshold),
         "05_IIF_PreFlight": build_preflight_docx_data(gl, coa),
+        "07_BS_Top20_Variance": build_bs_variance_docx_data(gl),
+        "08_PL_Top20_Variance": build_pl_variance_docx_data(gl),
     }
 
     # Report 6 - Reconciliation summary (simpler, text-based)
@@ -1501,7 +1788,7 @@ def main():
         st.markdown("### Export")
         export_iif = st.checkbox("Enable IIF Export", value=False)
         export_docx = st.checkbox("Export Reports as Word (.docx)", value=False,
-                                  help="Generate Apple-branded Word documents for all 6 reports.")
+                                  help="Generate Apple-branded Word documents for all 8 reports.")
 
     # ── Parse data ──
     gl = None
@@ -1552,6 +1839,8 @@ def main():
         "4 · Materiality",
         "5 · IIF Pre-Flight",
         "6 · Reconciliation",
+        "7 · BS Top 20 Variance",
+        "8 · P&L Top 20 Variance",
     ])
 
     with tabs[0]:
@@ -1571,6 +1860,12 @@ def main():
 
     with tabs[5]:
         report_reconciliation(gl, pdf_texts)
+
+    with tabs[6]:
+        report_bs_variance(gl)
+
+    with tabs[7]:
+        report_pl_variance(gl)
 
     # ── Word Document Export ──
     if export_docx:
