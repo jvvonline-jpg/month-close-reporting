@@ -10,8 +10,8 @@ Reports:
   4. Materiality & Risk Threshold
   5. IIF Import Pre-Flight Validation
   6. Multi-Source Reconciliation Summary
-  7. Top 20 Balance Sheet Accounts — Largest Variances (July–February)
-  8. Top 20 Profit & Loss Accounts — Largest Variances (July–February)
+  7. Top 20 Balance Sheet Accounts — Closing Month vs Preceding Months Avg
+  8. Top 20 Profit & Loss Accounts — Closing Month vs Preceding Months Avg
 """
 
 import streamlit as st
@@ -503,7 +503,7 @@ def report_flux(gl: pd.DataFrame):
     st.dataframe(display, use_container_width=True, hide_index=True)
 
 
-def report_vendor_gap(gl: pd.DataFrame):
+def report_vendor_gap(gl: pd.DataFrame, closing_month: int = None, start_month: int = None):
     """Report 2 — Recurring Vendor Gap Analysis ('Missing Bill')."""
     section("Recurring Vendor Gap Analysis")
 
@@ -516,18 +516,33 @@ def report_vendor_gap(gl: pd.DataFrame):
         st.info("No vendor names found in the GL.")
         return
 
-    periods = sorted(vendors["YearMonth"].dropna().unique())
-    if len(periods) < 3:
+    all_periods = sorted(vendors["YearMonth"].dropna().unique())
+    if len(all_periods) < 3:
         st.info("At least 3 months of history are needed to detect recurring vendors.")
         return
 
-    curr = periods[-1]
-    history = vendors[vendors["YearMonth"] != curr]
-    curr_vendors = set(vendors[vendors["YearMonth"] == curr]["Name"].unique())
+    # Determine closing period and preceding periods from user selection
+    if closing_month and start_month:
+        closing_periods = [p for p in all_periods if p.month == closing_month]
+        prec_month_nums = _get_preceding_months(closing_month, start_month)
+        preceding_periods = sorted([p for p in all_periods if p.month in prec_month_nums])
+        close_p = closing_periods[-1] if closing_periods else all_periods[-1]
+        analysis_periods = preceding_periods + [close_p]
+        # Filter to relevant periods
+        vendors_in_scope = vendors[vendors["YearMonth"].isin(analysis_periods)]
+    else:
+        close_p = all_periods[-1]
+        preceding_periods = all_periods[:-1]
+        analysis_periods = all_periods
+        vendors_in_scope = vendors
 
-    # Calculate vendor frequency
+    curr = close_p
+    history = vendors_in_scope[vendors_in_scope["YearMonth"] != curr]
+    curr_df = vendors_in_scope[vendors_in_scope["YearMonth"] == curr]
+    curr_vendors = set(curr_df["Name"].unique())
+
     vendor_periods = history.groupby("Name")["YearMonth"].nunique()
-    total_hist_months = len(periods) - 1
+    total_hist_months = len(preceding_periods)
     recurring = vendor_periods[vendor_periods >= max(2, total_hist_months * 0.5)]
 
     missing = [v for v in recurring.index if v not in curr_vendors and str(v).strip() and str(v) != "nan"]
@@ -562,6 +577,30 @@ def report_vendor_gap(gl: pd.DataFrame):
                 "Suggested Accrual": f"${avg_amt:,.2f}" if pd.notna(avg_amt) else "—",
             })
         st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
+
+        # ── Per-month transaction breakdown ──
+        section("Monthly Transaction Detail by Vendor")
+        st.markdown(f"Transactions per month for missing vendors across "
+                     f"**{', '.join(str(p) for p in preceding_periods)}** and closing month **{curr}**.")
+
+        month_cols = [str(p) for p in analysis_periods]
+        detail_rows = []
+        for v in missing:
+            v_all = vendors_in_scope[vendors_in_scope["Name"] == v]
+            row = {"Vendor": v}
+            for p in analysis_periods:
+                p_txns = v_all[v_all["YearMonth"] == p]
+                p_total = p_txns["Credit"].sum()
+                row[str(p)] = p_total if p_total != 0 else 0
+            detail_rows.append(row)
+
+        detail_df = pd.DataFrame(detail_rows)
+        # Format for display
+        disp = detail_df.copy()
+        for mc in month_cols:
+            if mc in disp.columns:
+                disp[mc] = disp[mc].map(lambda v: f"${v:,.2f}" if isinstance(v, (int, float)) and v != 0 else "—")
+        st.dataframe(disp, use_container_width=True, hide_index=True)
     else:
         st.success("All recurring vendors have activity in the current period.")
 
@@ -884,7 +923,7 @@ def report_reconciliation(gl: pd.DataFrame, pdf_texts: list[str]):
 
 
 # ─────────────────────────────────────────────────────────────
-# 3b · MULTI-MONTH VARIANCE REPORTS (July–February)
+# 3b · CLOSING-MONTH vs PRECEDING VARIANCE REPORTS
 # ─────────────────────────────────────────────────────────────
 
 # Balance-sheet keywords (assets, liabilities, equity)
@@ -916,6 +955,9 @@ _PL_KW = re.compile(
     r"gain|loss|discount)"
 )
 
+_MONTH_NAMES = ["January","February","March","April","May","June",
+                "July","August","September","October","November","December"]
+
 
 def _classify_account(acct_name: str) -> str:
     """Return 'BS', 'PL', or 'Unknown' based on account name keywords."""
@@ -926,16 +968,32 @@ def _classify_account(acct_name: str) -> str:
     return "Unknown"
 
 
-def _build_monthly_variance_table(gl: pd.DataFrame, account_type: str, top_n: int = 20):
-    """Build a month-over-month variance analysis for the given account type.
+def _get_preceding_months(closing_month: int, start_month: int) -> list[int]:
+    """Return the list of calendar months from start_month up to (but NOT including) closing_month.
 
-    Looks at July through February of the data range.
-    Returns (summary_df, detail_records, month_labels) or (None, None, None).
+    Wraps around December→January correctly.
+    Example: start=7, closing=3 → [7,8,9,10,11,12,1,2]
+    """
+    months = []
+    m = start_month
+    while m != closing_month:
+        months.append(m)
+        m = (m % 12) + 1
+    return months
+
+
+def _build_closing_variance_table(gl: pd.DataFrame, account_type: str,
+                                   closing_month: int, start_month: int,
+                                   top_n: int = 20):
+    """Build variance analysis: closing month total vs average of preceding months.
+
+    Returns (summary_df, preceding_labels, closing_label) or (None, None, None).
+    - summary_df has columns: Account, each preceding month total, Preceding Avg,
+      Closing Month total, Variance ($), Variance (%).
     """
     if "YearMonth" not in gl.columns or gl["YearMonth"].isna().all():
         return None, None, None
 
-    # Classify accounts
     gl = gl.copy()
     if "AcctClass" not in gl.columns:
         gl["AcctClass"] = gl["Account"].apply(_classify_account)
@@ -944,160 +1002,187 @@ def _build_monthly_variance_table(gl: pd.DataFrame, account_type: str, top_n: in
     if subset.empty:
         return None, None, None
 
-    periods = sorted(subset["YearMonth"].dropna().unique())
-    if len(periods) < 2:
+    all_periods = sorted(subset["YearMonth"].dropna().unique())
+    if len(all_periods) < 2:
         return None, None, None
 
-    # Filter to July–February window within the data range
-    target_months = {7, 8, 9, 10, 11, 12, 1, 2}
-    periods = [p for p in periods if p.month in target_months]
-    if len(periods) < 2:
-        # Fall back to all periods if no July–Feb data
-        periods = sorted(subset["YearMonth"].dropna().unique())
+    preceding_month_nums = _get_preceding_months(closing_month, start_month)
+    if not preceding_month_nums:
+        return None, None, None
+
+    # Find the closing-month period(s) and preceding period(s) in the data
+    closing_periods = [p for p in all_periods if p.month == closing_month]
+    preceding_periods = [p for p in all_periods if p.month in preceding_month_nums]
+
+    if not closing_periods or not preceding_periods:
+        return None, None, None
+
+    # Use the most recent closing period
+    close_p = closing_periods[-1]
+    closing_label = str(close_p)
+
+    # Sort preceding periods chronologically
+    preceding_periods = sorted(preceding_periods)
+    preceding_labels = [str(p) for p in preceding_periods]
 
     # Monthly totals per account
+    all_relevant = preceding_periods + [close_p]
     monthly = (
-        subset[subset["YearMonth"].isin(periods)]
+        subset[subset["YearMonth"].isin(all_relevant)]
         .groupby(["Account", "YearMonth"])["Amount"]
         .sum()
         .unstack(fill_value=0)
     )
 
-    # Compute month-over-month variances
-    variance_cols = []
-    month_labels = []
-    for i in range(1, len(periods)):
-        prev_p, curr_p = periods[i - 1], periods[i]
-        col_name = f"{prev_p}→{curr_p}"
-        monthly[col_name] = monthly.get(curr_p, 0) - monthly.get(prev_p, 0)
-        variance_cols.append(col_name)
-        month_labels.append(col_name)
+    # Compute preceding average
+    if preceding_periods:
+        prec_cols = [p for p in preceding_periods if p in monthly.columns]
+        if prec_cols:
+            monthly["Preceding Avg"] = monthly[prec_cols].mean(axis=1)
+        else:
+            monthly["Preceding Avg"] = 0
+    else:
+        monthly["Preceding Avg"] = 0
 
-    if not variance_cols:
-        return None, None, None
+    # Closing month
+    if close_p in monthly.columns:
+        monthly["Closing Month"] = monthly[close_p]
+    else:
+        monthly["Closing Month"] = 0
 
-    # Max absolute variance across all months for each account
-    monthly["Max_Abs_Var"] = monthly[variance_cols].abs().max(axis=1)
-    monthly = monthly.sort_values("Max_Abs_Var", ascending=False)
+    # Variance = Closing Month - Preceding Average
+    monthly["Variance"] = monthly["Closing Month"] - monthly["Preceding Avg"]
+    monthly["Var_%"] = np.where(
+        monthly["Preceding Avg"].abs() > 0.01,
+        monthly["Variance"] / monthly["Preceding Avg"].abs(),
+        np.nan,
+    )
+    monthly["Abs_Var"] = monthly["Variance"].abs()
+    monthly = monthly.sort_values("Abs_Var", ascending=False)
     top = monthly.head(top_n)
 
-    # Build detail records for display
-    detail = []
+    # Build summary
+    records = []
     for acct in top.index:
         row = {"Account": acct}
-        for p in periods:
+        for p in preceding_periods:
             row[str(p)] = top.at[acct, p] if p in top.columns else 0
-        for vc in variance_cols:
-            row[vc] = top.at[acct, vc]
-        row["Max Variance"] = top.at[acct, "Max_Abs_Var"]
-        detail.append(row)
+        row["Preceding Avg"] = top.at[acct, "Preceding Avg"]
+        row[f"Closing ({closing_label})"] = top.at[acct, "Closing Month"]
+        row["Variance ($)"] = top.at[acct, "Variance"]
+        row["Variance (%)"] = top.at[acct, "Var_%"]
+        records.append(row)
 
-    summary = pd.DataFrame(detail)
-    return summary, detail, month_labels
+    summary = pd.DataFrame(records)
+    return summary, preceding_labels, closing_label
 
 
-def report_bs_variance(gl: pd.DataFrame):
-    """Report 7 — Top 20 Balance Sheet Accounts by Largest Variance."""
-    section("Top 20 Balance Sheet — Largest Month-to-Month Variances")
+def report_bs_variance(gl: pd.DataFrame, closing_month: int, start_month: int):
+    """Report 7 — Top 20 Balance Sheet Accounts: Closing Month vs Preceding Avg."""
+    close_name = _MONTH_NAMES[closing_month - 1]
+    start_name = _MONTH_NAMES[start_month - 1]
+    section(f"Top 20 Balance Sheet — {close_name} Close vs {start_name}–{_MONTH_NAMES[((closing_month - 2) % 12)]} Avg")
 
-    summary, detail, month_labels = _build_monthly_variance_table(gl, "BS", 20)
+    summary, prec_labels, close_label = _build_closing_variance_table(gl, "BS", closing_month, start_month, 20)
 
     if summary is None or summary.empty:
-        st.warning("Could not identify enough Balance Sheet accounts or periods for variance analysis.")
+        st.warning("Could not identify enough Balance Sheet accounts or periods for variance analysis. "
+                    "Make sure the GL covers the selected closing and preceding months.")
         return
 
-    st.markdown("**Analysis window:** July through February (month-over-month variances)")
-    st.markdown(f"**Accounts analyzed:** Top 20 by largest single-month variance")
+    st.markdown(f"**Closing month:** {close_label} &nbsp;|&nbsp; **Preceding months:** {', '.join(prec_labels)}")
+    st.markdown("**Method:** Closing month total compared to average of preceding months")
 
     # Metric cards
     c1, c2, c3 = st.columns(3)
     top_acct = summary.iloc[0]["Account"] if len(summary) > 0 else "N/A"
-    max_var = summary.iloc[0]["Max Variance"] if len(summary) > 0 else 0
-    avg_max = summary["Max Variance"].mean()
+    max_var = summary.iloc[0]["Variance ($)"] if len(summary) > 0 else 0
+    avg_var = summary["Variance ($)"].abs().mean()
     with c1:
-        st.markdown(metric_card("Largest Swing", f"${max_var:,.2f}"), unsafe_allow_html=True)
+        st.markdown(metric_card("Largest Variance", f"${abs(max_var):,.2f}"), unsafe_allow_html=True)
     with c2:
         st.markdown(metric_card("Top Account", str(top_acct)[:35]), unsafe_allow_html=True)
     with c3:
-        st.markdown(metric_card("Avg Peak Variance", f"${avg_max:,.2f}"), unsafe_allow_html=True)
+        st.markdown(metric_card("Avg Abs Variance", f"${avg_var:,.2f}"), unsafe_allow_html=True)
 
     # Narrative
     section("Variance Highlights")
     for _, row in summary.head(5).iterrows():
         acct = row["Account"]
-        # Find the month with the largest swing
-        max_col = None
-        max_val = 0
-        for ml in month_labels:
-            if abs(row.get(ml, 0)) > abs(max_val):
-                max_val = row.get(ml, 0)
-                max_col = ml
-        direction = "increased" if max_val > 0 else "decreased"
+        var = row["Variance ($)"]
+        pct = row.get("Variance (%)", np.nan)
+        direction = "increased" if var > 0 else "decreased"
+        pct_str = f" ({abs(pct):.1%})" if pd.notna(pct) else ""
         narrative(
-            f"<strong>{acct}</strong> had its largest swing of "
-            f"<strong>${abs(max_val):,.2f}</strong> during {max_col}, "
-            f"where the balance {direction}. Peak absolute variance across all months: "
-            f"${row['Max Variance']:,.2f}."
+            f"<strong>{acct}</strong> {direction} by <strong>${abs(var):,.2f}</strong>{pct_str} "
+            f"in {close_label} compared to the preceding-months average of "
+            f"${row['Preceding Avg']:,.2f}."
         )
 
     # Detail table
     section("Full Variance Detail")
     display = summary.copy()
-    # Format currency columns
     for c in display.columns:
-        if c not in ("Account",):
+        if c == "Account":
+            continue
+        if c == "Variance (%)":
+            display[c] = display[c].map(lambda v: f"{v:.1%}" if pd.notna(v) else "—")
+        else:
             display[c] = display[c].map(lambda v: f"${v:,.2f}" if isinstance(v, (int, float)) else v)
     st.dataframe(display, use_container_width=True, hide_index=True)
 
 
-def report_pl_variance(gl: pd.DataFrame):
-    """Report 8 — Top 20 Profit & Loss Accounts by Largest Variance."""
-    section("Top 20 Profit & Loss — Largest Month-to-Month Variances")
+def report_pl_variance(gl: pd.DataFrame, closing_month: int, start_month: int):
+    """Report 8 — Top 20 P&L Accounts: Closing Month vs Preceding Avg."""
+    close_name = _MONTH_NAMES[closing_month - 1]
+    start_name = _MONTH_NAMES[start_month - 1]
+    section(f"Top 20 Profit & Loss — {close_name} Close vs {start_name}–{_MONTH_NAMES[((closing_month - 2) % 12)]} Avg")
 
-    summary, detail, month_labels = _build_monthly_variance_table(gl, "PL", 20)
+    summary, prec_labels, close_label = _build_closing_variance_table(gl, "PL", closing_month, start_month, 20)
 
     if summary is None or summary.empty:
-        st.warning("Could not identify enough P&L accounts or periods for variance analysis.")
+        st.warning("Could not identify enough P&L accounts or periods for variance analysis. "
+                    "Make sure the GL covers the selected closing and preceding months.")
         return
 
-    st.markdown("**Analysis window:** July through February (month-over-month variances)")
-    st.markdown(f"**Accounts analyzed:** Top 20 by largest single-month variance")
+    st.markdown(f"**Closing month:** {close_label} &nbsp;|&nbsp; **Preceding months:** {', '.join(prec_labels)}")
+    st.markdown("**Method:** Closing month total compared to average of preceding months")
 
     # Metric cards
     c1, c2, c3 = st.columns(3)
     top_acct = summary.iloc[0]["Account"] if len(summary) > 0 else "N/A"
-    max_var = summary.iloc[0]["Max Variance"] if len(summary) > 0 else 0
-    avg_max = summary["Max Variance"].mean()
+    max_var = summary.iloc[0]["Variance ($)"] if len(summary) > 0 else 0
+    avg_var = summary["Variance ($)"].abs().mean()
     with c1:
-        st.markdown(metric_card("Largest Swing", f"${max_var:,.2f}"), unsafe_allow_html=True)
+        st.markdown(metric_card("Largest Variance", f"${abs(max_var):,.2f}"), unsafe_allow_html=True)
     with c2:
         st.markdown(metric_card("Top Account", str(top_acct)[:35]), unsafe_allow_html=True)
     with c3:
-        st.markdown(metric_card("Avg Peak Variance", f"${avg_max:,.2f}"), unsafe_allow_html=True)
+        st.markdown(metric_card("Avg Abs Variance", f"${avg_var:,.2f}"), unsafe_allow_html=True)
 
     # Narrative
     section("Variance Highlights")
     for _, row in summary.head(5).iterrows():
         acct = row["Account"]
-        max_col = None
-        max_val = 0
-        for ml in month_labels:
-            if abs(row.get(ml, 0)) > abs(max_val):
-                max_val = row.get(ml, 0)
-                max_col = ml
-        direction = "increased" if max_val > 0 else "decreased"
+        var = row["Variance ($)"]
+        pct = row.get("Variance (%)", np.nan)
+        direction = "increased" if var > 0 else "decreased"
+        pct_str = f" ({abs(pct):.1%})" if pd.notna(pct) else ""
         narrative(
-            f"<strong>{acct}</strong> had its largest swing of "
-            f"<strong>${abs(max_val):,.2f}</strong> during {max_col}, "
-            f"where spending {direction}. Peak absolute variance across all months: "
-            f"${row['Max Variance']:,.2f}."
+            f"<strong>{acct}</strong> {direction} by <strong>${abs(var):,.2f}</strong>{pct_str} "
+            f"in {close_label} compared to the preceding-months average of "
+            f"${row['Preceding Avg']:,.2f}."
         )
 
     # Detail table
     section("Full Variance Detail")
     display = summary.copy()
     for c in display.columns:
-        if c not in ("Account",):
+        if c == "Account":
+            continue
+        if c == "Variance (%)":
+            display[c] = display[c].map(lambda v: f"{v:.1%}" if pd.notna(v) else "—")
+        else:
             display[c] = display[c].map(lambda v: f"${v:,.2f}" if isinstance(v, (int, float)) else v)
     st.dataframe(display, use_container_width=True, hide_index=True)
 
@@ -1407,57 +1492,73 @@ def build_flux_docx_data(gl: pd.DataFrame) -> dict:
     }
 
 
-def build_vendor_gap_docx_data(gl: pd.DataFrame) -> dict:
-    """Build report_data dict for Missing Bill report."""
+def build_vendor_gap_docx_data(gl: pd.DataFrame, closing_month: int = 3, start_month: int = 7) -> dict:
+    """Build report_data dict for Missing Bill report with per-month detail."""
     if "Name" not in gl.columns or "YearMonth" not in gl.columns:
         return None
     vendors = gl[gl["Name"].str.strip() != "nan"].copy()
     if vendors.empty:
         return None
-    periods = sorted(vendors["YearMonth"].dropna().unique())
-    if len(periods) < 3:
+    all_periods = sorted(vendors["YearMonth"].dropna().unique())
+    if len(all_periods) < 3:
         return None
 
-    curr = periods[-1]
-    history = vendors[vendors["YearMonth"] != curr]
-    curr_vendors = set(vendors[vendors["YearMonth"] == curr]["Name"].unique())
-    total_hist = len(periods) - 1
+    closing_periods = [p for p in all_periods if p.month == closing_month]
+    prec_month_nums = _get_preceding_months(closing_month, start_month)
+    preceding_periods = sorted([p for p in all_periods if p.month in prec_month_nums])
+    close_p = closing_periods[-1] if closing_periods else all_periods[-1]
+    analysis_periods = preceding_periods + [close_p]
+
+    vendors_in_scope = vendors[vendors["YearMonth"].isin(analysis_periods)]
+    history = vendors_in_scope[vendors_in_scope["YearMonth"] != close_p]
+    curr_vendors = set(vendors_in_scope[vendors_in_scope["YearMonth"] == close_p]["Name"].unique())
+    total_hist = len(preceding_periods)
     vendor_periods = history.groupby("Name")["YearMonth"].nunique()
     recurring = vendor_periods[vendor_periods >= max(2, total_hist * 0.5)]
     missing = [v for v in recurring.index if v not in curr_vendors and str(v).strip() and str(v) != "nan"]
 
-    rows = []
+    accrual_rows = []
     for v in missing:
         v_hist = history[history["Name"] == v]
         avg_amt = v_hist["Credit"].mean()
         last_date = v_hist["Date"].max()
         freq = v_hist["YearMonth"].nunique()
         typical_acct = v_hist["Account"].mode().iloc[0] if not v_hist["Account"].mode().empty else "Unknown"
-        rows.append([
-            str(v),
-            f"{freq}/{total_hist} months",
+        accrual_rows.append([
+            str(v), f"{freq}/{total_hist} months",
             f"${avg_amt:,.2f}" if pd.notna(avg_amt) else "N/A",
             str(last_date.date()) if pd.notna(last_date) else "N/A",
             str(typical_acct)[:40],
             f"${avg_amt:,.2f}" if pd.notna(avg_amt) else "N/A",
         ])
 
+    # Per-month transaction detail
+    month_headers = ["Vendor"] + [str(p) for p in analysis_periods]
+    month_rows = []
+    for v in missing:
+        v_all = vendors_in_scope[vendors_in_scope["Name"] == v]
+        r = [str(v)]
+        for p in analysis_periods:
+            total = v_all[v_all["YearMonth"] == p]["Credit"].sum()
+            r.append(f"${total:,.2f}" if total != 0 else "—")
+        month_rows.append(r)
+
     return {
         "title": "Recurring Vendor Gap Analysis",
-        "subtitle": "Organization  |  Missing Bill Report",
+        "subtitle": f"Organization  |  Missing Bill Report  |  Closing: {close_p}",
         "date": datetime.date.today().strftime("%d %b %Y"),
         "sections": [
             {"heading": "Summary",
              "paragraphs": [
-                 f"{len(recurring)} recurring vendors identified across {total_hist} months of history.",
-                 f"{len(missing)} vendor(s) are missing from the current period ({curr}) and may require accrual entries.",
+                 f"{len(recurring)} recurring vendors across {total_hist} preceding months.",
+                 f"{len(missing)} vendor(s) missing from closing period ({close_p}) — may need accrual entries.",
              ]},
-            {"heading": "Suggested Accruals",
-             "paragraphs": [],
+            {"heading": "Suggested Accruals", "paragraphs": [],
              "table": {
                  "headers": ["Vendor", "Frequency", "Avg Amount", "Last Seen", "Typical Account", "Suggested Accrual"],
-                 "rows": rows
-             }},
+                 "rows": accrual_rows}},
+            {"heading": "Monthly Transaction Detail", "paragraphs": [],
+             "table": {"headers": month_headers, "rows": month_rows}},
         ]
     }
 
@@ -1602,82 +1703,84 @@ def build_preflight_docx_data(gl: pd.DataFrame, coa: dict | None) -> dict:
     }
 
 
-def _build_variance_docx_data(gl: pd.DataFrame, account_type: str, title: str) -> dict:
-    """Build report_data for a multi-month variance report (BS or PL)."""
-    summary, detail, month_labels = _build_monthly_variance_table(gl, account_type, 20)
+def _build_variance_docx_data(gl: pd.DataFrame, account_type: str, title: str,
+                               closing_month: int, start_month: int) -> dict:
+    """Build report_data for closing-vs-preceding variance report (BS or PL)."""
+    summary, prec_labels, close_label = _build_closing_variance_table(
+        gl, account_type, closing_month, start_month, 20)
     if summary is None or summary.empty:
         return None
 
-    # Narratives for top 5
+    close_name = _MONTH_NAMES[closing_month - 1]
+    start_name = _MONTH_NAMES[start_month - 1]
+
     narratives = []
     for _, row in summary.head(5).iterrows():
         acct = row["Account"]
-        max_col = None
-        max_val = 0
-        for ml in month_labels:
-            if abs(row.get(ml, 0)) > abs(max_val):
-                max_val = row.get(ml, 0)
-                max_col = ml
-        direction = "increased" if max_val > 0 else "decreased"
+        var = row["Variance ($)"]
+        pct = row.get("Variance (%)", np.nan)
+        direction = "increased" if var > 0 else "decreased"
+        pct_str = f" ({abs(pct):.1%})" if pd.notna(pct) else ""
         narratives.append(
-            f"{acct} had its largest swing of ${abs(max_val):,.2f} during {max_col}, "
-            f"where the balance {direction}. Peak absolute variance: ${row['Max Variance']:,.2f}."
+            f"{acct} {direction} by ${abs(var):,.2f}{pct_str} in {close_label} "
+            f"compared to the preceding-months average of ${row['Preceding Avg']:,.2f}."
         )
 
-    # Table rows — Account + each month-over-month variance + Max Variance
-    headers = ["Account"] + month_labels + ["Max Variance"]
+    # Table headers: Account, each preceding month, Preceding Avg, Closing, Variance, Var %
+    headers = ["Account"] + prec_labels + ["Preceding Avg", f"Closing ({close_label})", "Variance ($)", "Variance (%)"]
     table_rows = []
     for _, row in summary.iterrows():
         r = [str(row["Account"])[:40]]
-        for ml in month_labels:
-            v = row.get(ml, 0)
+        for pl in prec_labels:
+            v = row.get(pl, 0)
             r.append(f"${v:,.2f}" if isinstance(v, (int, float)) else str(v))
-        r.append(f"${row['Max Variance']:,.2f}" if isinstance(row["Max Variance"], (int, float)) else str(row["Max Variance"]))
+        r.append(f"${row['Preceding Avg']:,.2f}")
+        r.append(f"${row[f'Closing ({close_label})']:,.2f}")
+        r.append(f"${row['Variance ($)']:,.2f}")
+        pct = row.get("Variance (%)", np.nan)
+        r.append(f"{pct:.1%}" if pd.notna(pct) else "N/A")
         table_rows.append(r)
 
     return {
         "title": title,
-        "subtitle": f"Organization  |  July–February Month-over-Month Analysis",
+        "subtitle": f"Organization  |  {close_name} Close vs {start_name}–{_MONTH_NAMES[((closing_month - 2) % 12)]} Avg",
         "date": datetime.date.today().strftime("%d %b %Y"),
         "sections": [
             {"heading": "Summary",
              "paragraphs": [
-                 f"Top 20 {account_type} accounts ranked by largest single-month variance.",
-                 f"Analysis covers {len(month_labels)} month-over-month transitions.",
+                 f"Top 20 {account_type} accounts ranked by largest variance.",
+                 f"Closing month {close_label} compared to average of {len(prec_labels)} preceding months.",
              ]},
             {"heading": "Variance Highlights", "paragraphs": narratives},
             {"heading": "Full Variance Detail",
              "paragraphs": [],
-             "table": {
-                 "headers": headers,
-                 "rows": table_rows,
-             }},
+             "table": {"headers": headers, "rows": table_rows}},
         ],
     }
 
 
-def build_bs_variance_docx_data(gl: pd.DataFrame) -> dict:
-    """Build report_data for BS variance report."""
-    return _build_variance_docx_data(gl, "BS", "Top 20 Balance Sheet — Largest Variances")
+def build_bs_variance_docx_data(gl: pd.DataFrame, closing_month: int, start_month: int) -> dict:
+    return _build_variance_docx_data(gl, "BS", "Top 20 Balance Sheet — Largest Variances",
+                                      closing_month, start_month)
 
 
-def build_pl_variance_docx_data(gl: pd.DataFrame) -> dict:
-    """Build report_data for P&L variance report."""
-    return _build_variance_docx_data(gl, "PL", "Top 20 Profit & Loss — Largest Variances")
+def build_pl_variance_docx_data(gl: pd.DataFrame, closing_month: int, start_month: int) -> dict:
+    return _build_variance_docx_data(gl, "PL", "Top 20 Profit & Loss — Largest Variances",
+                                      closing_month, start_month)
 
 
-def export_all_reports_docx(gl, coa, threshold, pdf_texts):
+def export_all_reports_docx(gl, coa, threshold, pdf_texts, closing_month=3, start_month=7):
     """Generate all 8 reports as Word documents and return as a zip buffer."""
     import zipfile
 
     reports = {
         "01_Flux_Narrative": build_flux_docx_data(gl),
-        "02_Missing_Bill_Analysis": build_vendor_gap_docx_data(gl),
+        "02_Missing_Bill_Analysis": build_vendor_gap_docx_data(gl, closing_month, start_month),
         "03_Suspense_Resolution": build_suspense_docx_data(gl, coa),
         "04_Materiality_Risk": build_materiality_docx_data(gl, threshold),
         "05_IIF_PreFlight": build_preflight_docx_data(gl, coa),
-        "07_BS_Top20_Variance": build_bs_variance_docx_data(gl),
-        "08_PL_Top20_Variance": build_pl_variance_docx_data(gl),
+        "07_BS_Top20_Variance": build_bs_variance_docx_data(gl, closing_month, start_month),
+        "08_PL_Top20_Variance": build_pl_variance_docx_data(gl, closing_month, start_month),
     }
 
     # Report 6 - Reconciliation summary (simpler, text-based)
@@ -1742,7 +1845,8 @@ def export_all_reports_docx(gl, coa, threshold, pdf_texts):
 # 5c · EXCEL EXPORT ENGINE
 # ─────────────────────────────────────────────────────────────
 
-def export_all_reports_xlsx(gl: pd.DataFrame, coa, threshold: float, pdf_texts: list) -> io.BytesIO:
+def export_all_reports_xlsx(gl: pd.DataFrame, coa, threshold: float, pdf_texts: list,
+                            closing_month: int = 3, start_month: int = 7) -> io.BytesIO:
     """Generate all 8 reports as sheets in a single styled Excel workbook."""
     from openpyxl import Workbook
     from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
@@ -1856,18 +1960,26 @@ def export_all_reports_xlsx(gl: pd.DataFrame, coa, threshold: float, pdf_texts: 
     if "Name" in gl.columns and "YearMonth" in gl.columns:
         vendors = gl[gl["Name"].str.strip() != "nan"].copy()
         if not vendors.empty:
-            periods = sorted(vendors["YearMonth"].dropna().unique())
-            if len(periods) >= 3:
+            all_periods = sorted(vendors["YearMonth"].dropna().unique())
+            closing_periods = [p for p in all_periods if p.month == closing_month]
+            prec_month_nums = _get_preceding_months(closing_month, start_month)
+            preceding_periods = sorted([p for p in all_periods if p.month in prec_month_nums])
+            close_p = closing_periods[-1] if closing_periods else all_periods[-1]
+            analysis_periods = preceding_periods + [close_p]
+
+            vendors_in_scope = vendors[vendors["YearMonth"].isin(analysis_periods)]
+            history = vendors_in_scope[vendors_in_scope["YearMonth"] != close_p]
+            curr_vendors = set(vendors_in_scope[vendors_in_scope["YearMonth"] == close_p]["Name"].unique())
+            total_hist = len(preceding_periods)
+
+            if total_hist >= 2:
                 ws = wb.create_sheet("2-Missing Bills")
-                curr = periods[-1]
-                _add_title_block(ws, "Recurring Vendor Gap Analysis", f"Current period: {curr}")
-                history = vendors[vendors["YearMonth"] != curr]
-                curr_vendors = set(vendors[vendors["YearMonth"] == curr]["Name"].unique())
-                total_hist = len(periods) - 1
+                _add_title_block(ws, "Recurring Vendor Gap Analysis", f"Closing: {close_p}")
                 vendor_periods = history.groupby("Name")["YearMonth"].nunique()
                 recurring = vendor_periods[vendor_periods >= max(2, total_hist * 0.5)]
                 missing = [v for v in recurring.index if v not in curr_vendors and str(v).strip() and str(v) != "nan"]
 
+                # Accrual summary table
                 headers = ["Vendor", "Frequency", "Avg Amount ($)", "Last Seen", "Typical Account", "Suggested Accrual ($)"]
                 rows = []
                 for v in missing:
@@ -1877,17 +1989,33 @@ def export_all_reports_xlsx(gl: pd.DataFrame, coa, threshold: float, pdf_texts: 
                     freq = v_hist["YearMonth"].nunique()
                     typical_acct = v_hist["Account"].mode().iloc[0] if not v_hist["Account"].mode().empty else "Unknown"
                     rows.append([
-                        str(v),
-                        f"{freq}/{total_hist}",
+                        str(v), f"{freq}/{total_hist}",
                         round(avg_amt, 2) if pd.notna(avg_amt) else 0,
                         str(last_date.date()) if pd.notna(last_date) else "",
                         str(typical_acct),
                         round(avg_amt, 2) if pd.notna(avg_amt) else 0,
                     ])
-                _write_table(ws, headers, rows)
+                next_r = _write_table(ws, headers, rows)
                 for ri in range(len(rows)):
                     for ci in [3, 6]:
                         ws.cell(row=5 + ri, column=ci).number_format = curr_fmt
+
+                # Per-month transaction detail
+                if missing:
+                    _add_section_heading(ws, "Monthly Transaction Detail")
+                    month_headers = ["Vendor"] + [str(p) for p in analysis_periods]
+                    month_rows = []
+                    for v in missing:
+                        v_all = vendors_in_scope[vendors_in_scope["Name"] == v]
+                        r = [str(v)]
+                        for p in analysis_periods:
+                            total = v_all[v_all["YearMonth"] == p]["Credit"].sum()
+                            r.append(round(total, 2) if total != 0 else 0)
+                        month_rows.append(r)
+                    mr_start = _write_table(ws, month_headers, month_rows)
+                    for ri in range(len(month_rows)):
+                        for ci in range(2, len(month_headers) + 1):
+                            ws.cell(row=mr_start - len(month_rows) + ri, column=ci).number_format = curr_fmt
 
     # ────────────────────────────────────────
     # Sheet 3: Suspense Reclass
@@ -2004,44 +2132,66 @@ def export_all_reports_xlsx(gl: pd.DataFrame, coa, threshold: float, pdf_texts: 
                 ws.cell(row=ws.max_row - len(rows) + ri + 1, column=ci).number_format = curr_fmt
 
     # ────────────────────────────────────────
-    # Sheet 7: BS Top 20 Variance
+    # Sheet 7: BS Top 20 Variance (Closing vs Preceding Avg)
     # ────────────────────────────────────────
-    summary_bs, detail_bs, labels_bs = _build_monthly_variance_table(gl, "BS", 20)
+    summary_bs, prec_bs, close_bs = _build_closing_variance_table(gl, "BS", closing_month, start_month, 20)
     if summary_bs is not None and not summary_bs.empty:
+        close_name = _MONTH_NAMES[closing_month - 1]
+        start_name = _MONTH_NAMES[start_month - 1]
         ws = wb.create_sheet("7-BS Top20 Variance")
-        _add_title_block(ws, "Top 20 Balance Sheet — Largest Variances", "July–February Month-over-Month")
-        headers = ["Account"] + labels_bs + ["Max Variance ($)"]
+        _add_title_block(ws, "Top 20 Balance Sheet — Largest Variances",
+                         f"{close_name} Close vs {start_name}–{_MONTH_NAMES[((closing_month - 2) % 12)]} Avg")
+        headers = list(summary_bs.columns)
         rows = []
         for _, row in summary_bs.iterrows():
-            r = [str(row["Account"])]
-            for ml in labels_bs:
-                r.append(round(row.get(ml, 0), 2) if isinstance(row.get(ml, 0), (int, float)) else 0)
-            r.append(round(row["Max Variance"], 2) if isinstance(row["Max Variance"], (int, float)) else 0)
-            rows.append(r)
-        next_row = _write_table(ws, headers, rows)
-        for ri in range(len(rows)):
-            for ci in range(2, len(headers) + 1):
-                ws.cell(row=5 + ri, column=ci).number_format = curr_fmt
-
-    # ────────────────────────────────────────
-    # Sheet 8: P&L Top 20 Variance
-    # ────────────────────────────────────────
-    summary_pl, detail_pl, labels_pl = _build_monthly_variance_table(gl, "PL", 20)
-    if summary_pl is not None and not summary_pl.empty:
-        ws = wb.create_sheet("8-PL Top20 Variance")
-        _add_title_block(ws, "Top 20 Profit & Loss — Largest Variances", "July–February Month-over-Month")
-        headers = ["Account"] + labels_pl + ["Max Variance ($)"]
-        rows = []
-        for _, row in summary_pl.iterrows():
-            r = [str(row["Account"])]
-            for ml in labels_pl:
-                r.append(round(row.get(ml, 0), 2) if isinstance(row.get(ml, 0), (int, float)) else 0)
-            r.append(round(row["Max Variance"], 2) if isinstance(row["Max Variance"], (int, float)) else 0)
+            r = []
+            for h in headers:
+                v = row[h]
+                if h == "Account":
+                    r.append(str(v)[:40])
+                elif h == "Variance (%)":
+                    r.append(round(v, 4) if pd.notna(v) else None)
+                else:
+                    r.append(round(v, 2) if isinstance(v, (int, float)) else v)
             rows.append(r)
         _write_table(ws, headers, rows)
         for ri in range(len(rows)):
             for ci in range(2, len(headers) + 1):
-                ws.cell(row=5 + ri, column=ci).number_format = curr_fmt
+                if headers[ci - 1] == "Variance (%)":
+                    ws.cell(row=5 + ri, column=ci).number_format = pct_fmt
+                else:
+                    ws.cell(row=5 + ri, column=ci).number_format = curr_fmt
+
+    # ────────────────────────────────────────
+    # Sheet 8: P&L Top 20 Variance (Closing vs Preceding Avg)
+    # ────────────────────────────────────────
+    summary_pl, prec_pl, close_pl = _build_closing_variance_table(gl, "PL", closing_month, start_month, 20)
+    if summary_pl is not None and not summary_pl.empty:
+        close_name = _MONTH_NAMES[closing_month - 1]
+        start_name = _MONTH_NAMES[start_month - 1]
+        ws = wb.create_sheet("8-PL Top20 Variance")
+        _add_title_block(ws, "Top 20 Profit & Loss — Largest Variances",
+                         f"{close_name} Close vs {start_name}–{_MONTH_NAMES[((closing_month - 2) % 12)]} Avg")
+        headers = list(summary_pl.columns)
+        rows = []
+        for _, row in summary_pl.iterrows():
+            r = []
+            for h in headers:
+                v = row[h]
+                if h == "Account":
+                    r.append(str(v)[:40])
+                elif h == "Variance (%)":
+                    r.append(round(v, 4) if pd.notna(v) else None)
+                else:
+                    r.append(round(v, 2) if isinstance(v, (int, float)) else v)
+            rows.append(r)
+        _write_table(ws, headers, rows)
+        for ri in range(len(rows)):
+            for ci in range(2, len(headers) + 1):
+                if headers[ci - 1] == "Variance (%)":
+                    ws.cell(row=5 + ri, column=ci).number_format = pct_fmt
+                else:
+                    ws.cell(row=5 + ri, column=ci).number_format = curr_fmt
 
     # ── Write to buffer ──
     buf = io.BytesIO()
@@ -2083,6 +2233,26 @@ def main():
             type=["pdf"],
             accept_multiple_files=True,
             help="Upload PDFs for multi-source reconciliation.",
+        )
+
+        st.markdown("---")
+        st.markdown("### Period Settings")
+
+        _month_names = ["January","February","March","April","May","June",
+                        "July","August","September","October","November","December"]
+        closing_month = st.selectbox(
+            "Closing Month",
+            options=list(range(1, 13)),
+            format_func=lambda m: _month_names[m - 1],
+            index=2,  # default March
+            help="The month you are closing. Variance analysis compares this month against the preceding months.",
+        )
+        start_month = st.selectbox(
+            "Variance Start Month",
+            options=list(range(1, 13)),
+            format_func=lambda m: _month_names[m - 1],
+            index=6,  # default July
+            help="First month of the preceding period used for variance comparison (e.g. July for a fiscal year starting July 1).",
         )
 
         st.markdown("---")
@@ -2161,7 +2331,7 @@ def main():
         report_flux(gl)
 
     with tabs[1]:
-        report_vendor_gap(gl)
+        report_vendor_gap(gl, closing_month, start_month)
 
     with tabs[2]:
         report_suspense(gl, coa)
@@ -2176,10 +2346,10 @@ def main():
         report_reconciliation(gl, pdf_texts)
 
     with tabs[6]:
-        report_bs_variance(gl)
+        report_bs_variance(gl, closing_month, start_month)
 
     with tabs[7]:
-        report_pl_variance(gl)
+        report_pl_variance(gl, closing_month, start_month)
 
     # ── Word Document Export ──
     if export_docx:
@@ -2188,7 +2358,7 @@ def main():
         if st.button("Generate All Reports as .docx", type="primary"):
             with st.spinner("Generating Apple-branded Word documents..."):
                 try:
-                    zip_buf, generated = export_all_reports_docx(gl, coa, threshold, pdf_texts)
+                    zip_buf, generated = export_all_reports_docx(gl, coa, threshold, pdf_texts, closing_month, start_month)
                     st.success(f"Generated {len(generated)} report(s).")
                     st.download_button(
                         label="Download All Reports (.zip)",
@@ -2206,7 +2376,7 @@ def main():
         if st.button("Generate All Reports as .xlsx", type="primary"):
             with st.spinner("Building Excel workbook..."):
                 try:
-                    xlsx_buf = export_all_reports_xlsx(gl, coa, threshold, pdf_texts)
+                    xlsx_buf = export_all_reports_xlsx(gl, coa, threshold, pdf_texts, closing_month, start_month)
                     st.success("Excel workbook generated with all 8 reports.")
                     st.download_button(
                         label="Download Excel Workbook (.xlsx)",
